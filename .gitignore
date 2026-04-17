@@ -1,0 +1,44 @@
+# Dataset and test corpus
+/2025/
+/2025_dataset.jsonl
+/data/
+/dataset/
+/bbs_2025_md/
+
+# Future local knowledge bases should be mounted or copied locally, not committed by default.
+/knowledge_base/
+
+# Generated runtime artifacts
+/outputs/
+/logs/
+/models/
+/evaluation_results.jsonl
+/evaluation_summary.json
+/baseline_score.json
+/agent_score.json
+/compare_report.json
+/error_analysis.json
+
+# Python and uv environments
+/.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+/.pytest_cache/
+/.mypy_cache/
+/.ruff_cache/
+
+# Local secrets and machine-specific config
+.env
+.env.*
+/configs/local.yaml
+/configs/*.local.yaml
+
+# OS and editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+

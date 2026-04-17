@@ -1,0 +1,49 @@
+paths:
+  dataset: 2025_dataset.jsonl
+  image_root: 2025
+  local_corpus_root: knowledge_base
+  outputs_dir: outputs
+  logs_dir: logs
+
+model:
+  provider: dashscope_openai_compatible
+  api_key_env: DASHSCOPE_API_KEY
+  base_url_env: DASHSCOPE_BASE_URL
+  default_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  agent_model_env: AGENT_MODEL
+  judge_model_env: JUDGE_MODEL
+  default_agent_model: qwen3.6-plus
+  default_judge_model: qwen-plus
+  temperature: 0.2
+  max_tokens: 2000
+
+agent:
+  strategy: single_agent_web_reasoning
+  max_reflection_rounds: 1
+  max_local_docs: 4
+  max_web_results: 5
+  enable_local_retrieval: false
+  allow_test_corpus_retrieval: false
+  enable_web_search: true
+  enable_browser_fallback: false
+  use_images: true
+  send_images_to_llm: true
+  max_llm_images: 4
+
+evaluation:
+  semantic_backend: auto
+  bertscore_model: models/bert-base-chinese
+  bertscore_num_layers: 12
+  sentence_transformer_model: models/sentence-transformers__paraphrase-multilingual-MiniLM-L12-v2
+  final_weights:
+    semantic_similarity: 0.60
+    rouge_l: 0.25
+    bigram_jaccard: 0.15
+  enable_llm_judge: false
+  enable_llm_scoring_points: false
+
+runtime:
+  seed: 42
+  request_timeout_seconds: 20
+  max_workers: 1
+  resume: true
