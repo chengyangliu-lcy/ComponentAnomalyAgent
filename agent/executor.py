@@ -113,7 +113,8 @@ class Executor:
 
     def _web_search(self, plan: AgentPlan, trace: TraceLogger) -> List[Evidence]:
         all_evidence: List[Evidence] = []
-        for query in plan.queries[:2]:
+        max_queries = int(self.config.get("max_web_queries", 3))
+        for query in plan.queries[:max_queries]:
             with timer() as elapsed:
                 results, error = self.web_search.search(query, limit=int(self.config.get("max_web_results", 5)))
                 trace.add(
@@ -129,7 +130,22 @@ class Executor:
                     )
                 )
             all_evidence.extend(results)
-            for result in results[:2]:
+            successful_reads = 0
+            for result in results:
+                if successful_reads >= int(self.config.get("max_web_pages_to_read", 2)):
+                    break
+                if self._should_skip_page_read(result.source):
+                    trace.add(
+                        ToolEvent(
+                            tool_name="web_reader",
+                            action="skip_page_read",
+                            success=True,
+                            summary=result.source,
+                            inputs={"url": result.source},
+                            outputs={"reason": "search result snippet kept as evidence; page likely binary or blocked"},
+                        )
+                    )
+                    continue
                 with timer() as read_elapsed:
                     page = self.web_reader.read(result.source)
                     if not page.evidence and self.config.get("enable_browser_fallback", False):
@@ -150,4 +166,12 @@ class Executor:
                     )
                     if page.evidence:
                         all_evidence.append(page.evidence)
+                        successful_reads += 1
         return all_evidence
+
+    def _should_skip_page_read(self, url: str) -> bool:
+        lowered = url.lower()
+        if lowered.endswith(".pdf") or "/pdf/" in lowered or "/resource/en/datasheet/" in lowered:
+            return True
+        blocked_product_pages = ("onsemi.com/products/", "st.com/en/power-management/")
+        return any(marker in lowered for marker in blocked_product_pages)

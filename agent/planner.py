@@ -50,10 +50,42 @@ class Planner:
 
     def _queries(self, question: str) -> List[str]:
         normalized = re.sub(r"\s+", " ", question).strip()
-        short = normalized[:120]
-        keywords = re.findall(r"[A-Za-z0-9_.+-]+|[\u4e00-\u9fff]{2,}", normalized)
-        keyword_query = " ".join(keywords[:12])
-        queries = [q for q in [short, keyword_query] if q]
+        tokens = re.findall(r"[A-Za-z0-9_.+-]+|[\u4e00-\u9fff]{2,}", normalized)
+        upper_tokens = {token.upper() for token in tokens}
+        electronics_terms = [token for token in tokens if token.upper() in {"TL431", "MOS", "DCDC", "PWM", "PFC"}]
+        electronics_terms.extend(
+            token
+            for token in tokens
+            if re.fullmatch(r"[RCLDUQ]\d+[A-Za-z]?", token.upper())
+            or re.fullmatch(r"[A-Z]{2,}\d+[A-Z0-9-]*", token.upper())
+        )
+        for term in ["输出电压", "纹波", "光耦", "反馈", "闭环", "补偿", "滤波", "噪声", "电源", "电路"]:
+            if term in question:
+                electronics_terms.append(term)
+        for term in ["反激", "开关电源", "限流", "电流检测", "采样电阻", "电流采样", "尖峰", "低通滤波"]:
+            if term in question:
+                electronics_terms.append(term)
+        if "LLC" in upper_tokens:
+            electronics_terms.extend(["LLC谐振电源", "谐振", "开关电源"])
+        core = " ".join(list(dict.fromkeys(electronics_terms))[:12])
+        if not core:
+            core = " ".join(tokens[:10])
+        core_without_ambiguous_llc = " ".join(
+            term for term in core.split() if term not in {"LLC", "LLC谐振电源", "谐振"}
+        )
+        queries = [
+            f"{core_without_ambiguous_llc or core} 原因 处理 电子电路",
+            f"{core} 原因 处理 开关电源",
+        ]
+        english_queries: list[str] = []
+        if "TL431" in upper_tokens or "光耦" in question:
+            english_queries.append("TL431 optocoupler feedback compensation power supply ripple")
+        if any(term in question for term in ["反激", "限流", "电流检测", "电流采样", "采样电阻"]):
+            english_queries.append("flyback current sense resistor RC filter leading edge spike blanking")
+        if any(term in question for term in ["补偿", "反馈", "电阻", "电容"]):
+            english_queries.append("power supply feedback loop compensation resistor capacitor")
+        english_queries.append(f"{core} feedback compensation ripple power supply")
+        queries.extend(english_queries)
         return list(dict.fromkeys(queries))[:3]
 
     def _needs_web(self, question: str) -> bool:

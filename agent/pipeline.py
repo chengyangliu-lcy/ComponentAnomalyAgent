@@ -47,7 +47,11 @@ class AgentPipeline:
             image_resolver=image_resolver,
             retriever=retriever,
             file_reader=FileReader(),
-            web_search=WebSearch(timeout=timeout),
+            web_search=WebSearch(
+                timeout=timeout,
+                provider=str(agent_cfg.get("search_provider", "duckduckgo")),
+                cache_ttl_seconds=int(agent_cfg.get("search_cache_ttl_seconds", 900)),
+            ),
             web_reader=WebReader(timeout=timeout),
             browser=BrowserFallback(),
         )
