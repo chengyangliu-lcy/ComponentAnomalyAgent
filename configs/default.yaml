@@ -14,14 +14,18 @@ model:
   judge_model_env: JUDGE_MODEL
   default_agent_model: qwen3.6-plus
   default_judge_model: qwen-plus
-  temperature: 0.2
+  temperature: 0.7
   max_tokens: 2000
 
 agent:
   strategy: single_agent_web_reasoning
   max_reflection_rounds: 1
   max_local_docs: 4
-  max_web_results: 5
+  max_web_queries: 3
+  max_web_results: 8
+  max_web_pages_to_read: 1
+  search_provider: duckduckgo
+  search_cache_ttl_seconds: 900
   enable_local_retrieval: false
   allow_test_corpus_retrieval: false
   enable_web_search: true
@@ -36,10 +40,16 @@ evaluation:
   bertscore_num_layers: 12
   sentence_transformer_model: models/sentence-transformers__paraphrase-multilingual-MiniLM-L12-v2
   final_weights:
+    llm_judge: 0.50
+    semantic_similarity: 0.25
+    scoring_point_coverage: 0.10
+    rouge_l: 0.10
+    bigram_jaccard: 0.05
+  legacy_final_weights:
     semantic_similarity: 0.60
     rouge_l: 0.25
     bigram_jaccard: 0.15
-  enable_llm_judge: false
+  enable_llm_judge: true
   enable_llm_scoring_points: false
 
 runtime:
