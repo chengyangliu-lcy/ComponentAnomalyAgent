@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -28,13 +30,16 @@ def read_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
 def append_jsonl(path: Path, row: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        f.write(json.dumps(_json_safe(row), ensure_ascii=False, allow_nan=False) + "\n")
 
 
 def write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    temp_path = path.with_name(f".{path.name}.tmp")
+    with temp_path.open("w", encoding="utf-8") as f:
+        json.dump(_json_safe(payload), f, ensure_ascii=False, indent=2, allow_nan=False)
+        f.write("\n")
+    os.replace(temp_path, path)
 
 
 def compact_text(text: str, max_chars: int = 4000) -> str:
@@ -43,3 +48,20 @@ def compact_text(text: str, max_chars: int = 4000) -> str:
         return normalized
     return normalized[:max_chars] + "..."
 
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(_json_safe(key)): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, str):
+        cleaned = value.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+        return "".join(
+            char
+            if char in "\n\r\t" or ord(char) >= 32
+            else "\ufffd"
+            for char in cleaned
+        )
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return value

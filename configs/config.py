@@ -70,6 +70,11 @@ class RuntimeConfig:
         return os.environ.get(env_name) or self.raw["model"]["default_agent_model"]
 
     @property
+    def vision_model(self) -> str:
+        env_name = self.raw["model"].get("vision_model_env", "VISION_MODEL")
+        return os.environ.get(env_name) or self.raw["model"].get("default_vision_model") or self.agent_model
+
+    @property
     def judge_model(self) -> str:
         env_name = self.raw["model"].get("judge_model_env", "JUDGE_MODEL")
         return os.environ.get(env_name) or self.raw["model"]["default_judge_model"]

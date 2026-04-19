@@ -24,19 +24,34 @@ class LLMClient:
         model: str,
         temperature: float = 0.2,
         max_tokens: int = 2000,
+        timeout: float | None = None,
+        max_retries: int = 0,
+        extra_body: Dict[str, Any] | None = None,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
-        self._client = OpenAI(api_key=api_key, base_url=base_url) if api_key else None
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.extra_body = dict(extra_body or {})
+        self._client = (
+            OpenAI(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=max_retries)
+            if api_key
+            else None
+        )
 
     @property
     def available(self) -> bool:
         return self._client is not None
 
-    def chat(self, messages: List[Dict[str, Any]], temperature: float | None = None) -> LLMResponse:
+    def chat(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: float | None = None,
+        response_format: Dict[str, Any] | None = None,
+    ) -> LLMResponse:
         if not self._client:
             return LLMResponse(
                 content="",
@@ -44,12 +59,17 @@ class LLMClient:
                 error="LLM API key is not configured; fallback logic was used.",
             )
         try:
-            response = self._client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=self.temperature if temperature is None else temperature,
-                max_tokens=self.max_tokens,
-            )
+            payload: Dict[str, Any] = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": self.temperature if temperature is None else temperature,
+                "max_tokens": self.max_tokens,
+            }
+            if response_format:
+                payload["response_format"] = response_format
+            if self.extra_body:
+                payload["extra_body"] = self.extra_body
+            response = self._client.chat.completions.create(**payload)
             usage = getattr(response, "usage", None)
             token_usage = usage.model_dump() if hasattr(usage, "model_dump") else {}
             return LLMResponse(
@@ -59,8 +79,13 @@ class LLMClient:
         except Exception as exc:  # noqa: BLE001
             return LLMResponse(content="", token_usage={}, error=str(exc))
 
-    def json_chat(self, messages: List[Dict[str, Any]], temperature: float = 0.1) -> tuple[Dict[str, Any], Optional[str]]:
-        response = self.chat(messages, temperature=temperature)
+    def json_chat(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: float = 0.1,
+        response_format: Dict[str, Any] | None = None,
+    ) -> tuple[Dict[str, Any], Optional[str]]:
+        response = self.chat(messages, temperature=temperature, response_format=response_format)
         if response.error:
             return {}, response.error
         text = response.content.strip()
@@ -78,4 +103,3 @@ class LLMClient:
             return json.loads(text), None
         except Exception as exc:  # noqa: BLE001
             return {}, f"failed to parse JSON from judge response: {exc}; raw={response.content[:200]}"
-

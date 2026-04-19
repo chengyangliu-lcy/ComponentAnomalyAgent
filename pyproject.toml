@@ -3,11 +3,13 @@ name = "component-anomaly-agent"
 version = "0.1.0"
 description = "Agent system for component anomaly QA, inference tracing, and evaluation."
 readme = "README.md"
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.12,<3.14"
 dependencies = [
     "beautifulsoup4>=4.12.0",
     "bert-score>=0.3.13",
     "openai>=1.0.0",
+    "openhands-sdk>=1.17.0",
+    "openhands-tools>=1.17.0",
     "playwright>=1.40.0",
     "pyyaml>=6.0",
     "requests>=2.31.0",
@@ -17,4 +19,3 @@ dependencies = [
 
 [tool.uv]
 package = false
-

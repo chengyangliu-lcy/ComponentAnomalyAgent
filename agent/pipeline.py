@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from agent.executor import Executor
+from agent.openhands_runtime import OpenHandsEvidenceRuntime
 from agent.planner import Planner
 from agent.reflector import Reflector
 from agent.synthesizer import AnswerSynthesizer
@@ -24,6 +25,12 @@ class AgentPipeline:
     def __init__(self, config: RuntimeConfig) -> None:
         self.config = config
         agent_cfg: Dict[str, Any] = dict(config.raw.get("agent", {}))
+        self.strategy = str(agent_cfg.get("strategy", "legacy_single_agent_web_reasoning"))
+        self.openhands_runtime = (
+            OpenHandsEvidenceRuntime(config)
+            if self.strategy in {"openhands_evidence_agent", "agentic_tool_loop"}
+            else None
+        )
         model_cfg = config.raw.get("model", {})
         timeout = int(config.raw.get("runtime", {}).get("request_timeout_seconds", 20))
         image_resolver = ImageResolver(config.image_root)
@@ -40,6 +47,7 @@ class AgentPipeline:
             model=config.agent_model,
             temperature=float(model_cfg.get("temperature", 0.2)),
             max_tokens=int(model_cfg.get("max_tokens", 2000)),
+            timeout=timeout,
         )
         self.planner = Planner(agent_cfg)
         self.executor = Executor(
@@ -63,6 +71,19 @@ class AgentPipeline:
         )
 
     def run_sample(self, sample: StandardSample) -> InferenceResult:
+        if self.openhands_runtime is not None:
+            try:
+                return self.openhands_runtime.run_sample(sample)
+            except Exception as exc:  # noqa: BLE001
+                if not bool(self.config.raw.get("agent", {}).get("fallback_to_legacy_on_runtime_error", True)):
+                    raise
+                legacy = self._run_legacy_sample(sample)
+                legacy.errors.insert(0, f"{self.strategy} failed; legacy fallback used: {exc}")
+                legacy.reasoning_summary = f"Agentic runtime failed and fell back to legacy pipeline. {legacy.reasoning_summary}"
+                return legacy
+        return self._run_legacy_sample(sample)
+
+    def _run_legacy_sample(self, sample: StandardSample) -> InferenceResult:
         start = time.perf_counter()
         trace = TraceLogger()
         errors: list[str] = []

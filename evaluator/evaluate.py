@@ -43,6 +43,7 @@ class Evaluator:
     def __init__(self, config: RuntimeConfig) -> None:
         eval_cfg = config.raw.get("evaluation", {})
         model_cfg = config.raw.get("model", {})
+        timeout = int(config.raw.get("runtime", {}).get("request_timeout_seconds", 20))
         self.weights = eval_cfg.get("final_weights", {})
         self.legacy_weights = eval_cfg.get("legacy_final_weights", {})
         self.semantic = SemanticSimilarity(
@@ -57,6 +58,7 @@ class Evaluator:
             model=config.judge_model,
             temperature=float(model_cfg.get("temperature", 0.2)),
             max_tokens=int(model_cfg.get("max_tokens", 2000)),
+            timeout=timeout,
         )
         self.judge = LLMJudge(judge_llm, enabled=bool(eval_cfg.get("enable_llm_judge", True)))
 

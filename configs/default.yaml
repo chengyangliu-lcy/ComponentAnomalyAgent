@@ -11,15 +11,36 @@ model:
   base_url_env: DASHSCOPE_BASE_URL
   default_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
   agent_model_env: AGENT_MODEL
+  vision_model_env: VISION_MODEL
   judge_model_env: JUDGE_MODEL
   default_agent_model: qwen3.6-plus
+  default_vision_model: qwen3.6-plus
   default_judge_model: qwen-plus
   temperature: 0.7
   max_tokens: 2000
+  planner_extra_body:
+    enable_thinking: false
+  vision_extra_body:
+    enable_thinking: false
+  answer_extra_body:
+    enable_thinking: false
 
 agent:
-  strategy: single_agent_web_reasoning
+  strategy: agentic_tool_loop
+  legacy_strategy: legacy_single_agent_web_reasoning
   max_reflection_rounds: 1
+  max_iterations: 8
+  max_total_seconds: 180
+  planner_timeout_seconds: 25
+  tool_timeout_seconds: 20
+  vision_timeout_seconds: 35
+  final_answer_timeout_seconds: 60
+  web_read_timeout_seconds: 15
+  max_consecutive_tool_errors: 3
+  max_planner_failures: 2
+  tool_concurrency_limit: 4
+  enable_subagents: true
+  fallback_to_legacy_on_runtime_error: true
   max_local_docs: 4
   max_web_queries: 3
   max_web_results: 8
@@ -29,10 +50,35 @@ agent:
   enable_local_retrieval: false
   allow_test_corpus_retrieval: false
   enable_web_search: true
+  web_search_mode: auto
+  enable_llm_web_decision: false
+  min_evidence_before_search: 2
   enable_browser_fallback: false
   use_images: true
   send_images_to_llm: true
+  enable_image_inspection_llm: true
+  image_inspection_max_tokens: 1500
   max_llm_images: 4
+  max_image_inspect_attempts: 1
+  image_payload_format: openai_image_url
+  image_max_side: 1280
+  image_jpeg_quality: 75
+
+web:
+  provider_order:
+    - tavily
+    - brave
+    - bing
+    - serpapi
+    - html
+  max_results_per_query: 6
+  max_pages_to_read: 3
+  api_key_envs:
+    tavily: TAVILY_API_KEY
+    brave: BRAVE_SEARCH_API_KEY
+    bing: BING_SEARCH_API_KEY
+    serpapi: SERPAPI_API_KEY
+  api_keys: {}
 
 evaluation:
   semantic_backend: auto
@@ -54,6 +100,6 @@ evaluation:
 
 runtime:
   seed: 42
-  request_timeout_seconds: 20
+  request_timeout_seconds: 90
   max_workers: 1
   resume: true

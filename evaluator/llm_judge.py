@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+from agent.prompts import JUDGE_SYSTEM_PROMPT, build_judge_user_prompt
 from llm_client import LLMClient
 
 
@@ -31,42 +32,10 @@ class LLMJudge:
         if not self.llm.available:
             return dict(DEFAULT_DISABLED_JUDGE)
 
-        prompt = f"""你是一个严格、公正的中文技术问答评测器。请对比参考答案和预测答案，输出唯一 JSON，不要输出 Markdown。
-评分要求：
-1. accuracy/completeness/clarity/usefulness 使用 1-5 分，5 分最好，保持与 qwen_eval.py 可比。
-2. factual_consistency 使用 0-1 小数。
-3. score 使用 0-1 小数，按以下公式给出：
-   score = 0.35 * AccuracyNorm + 0.25 * CompletenessNorm + 0.20 * FactualConsistency + 0.10 * UsefulnessNorm + 0.10 * ClarityNorm
-   其中 AccuracyNorm/CompletenessNorm/UsefulnessNorm/ClarityNorm = (对应 1-5 分 - 1) / 4。
-4. 如果预测答案编造型号、参数、波形、事实来源或关键原理，应显著降低 accuracy、factual_consistency 和 score。
-5. 如果预测答案表达不同但技术含义正确，不要因为字面不同扣重分。
-
-必须输出 JSON 字段：
-{{
-  "score": 0.0,
-  "accuracy": 1,
-  "completeness": 1,
-  "clarity": 1,
-  "usefulness": 1,
-  "average_score": 1.0,
-  "factual_consistency": 0.0
-}}
-
-问题：
-{question}
-
-参考答案：
-{reference}
-
-预测答案：
-{prediction}
-
-采分点命中结果：
-{scoring_points}
-"""
+        prompt = build_judge_user_prompt(question, reference, prediction, scoring_points)
         result, error = self.llm.json_chat(
             [
-                {"role": "system", "content": "你是专业、严格、可复现的中文技术答案质量评估工具。"},
+                {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.1,

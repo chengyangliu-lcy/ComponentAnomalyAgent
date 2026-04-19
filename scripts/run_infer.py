@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
 from agent.pipeline import AgentPipeline, result_path
 from configs.config import load_config
 from tools.dataset_parser import DatasetParser
+from tools.sample_ids import filter_items_by_sample_ids, read_sample_ids_file
 from tools.utils import append_jsonl, write_json
 
 
@@ -26,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default=None)
     parser.add_argument("--experiment", default="agent_run")
     parser.add_argument("--sample-id", default=None)
+    parser.add_argument("--sample-ids-file", default=None, help="Text file with one sample_id/post_id per line.")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--output", default=None)
     parser.add_argument("--enable-web", action="store_true")
@@ -48,11 +50,22 @@ def main() -> None:
         samples = [sample for sample in samples if sample.sample_id == args.sample_id or sample.post_id == args.sample_id]
         if not samples:
             raise SystemExit(f"sample not found: {args.sample_id}")
+    sample_ids = read_sample_ids_file(args.sample_ids_file)
+    if sample_ids:
+        before = len(samples)
+        samples = filter_items_by_sample_ids(samples, sample_ids, lambda sample: sample.sample_id)
+        if not samples:
+            raise SystemExit(f"no samples matched --sample-ids-file: {args.sample_ids_file}")
+        missing = len(sample_ids) - len(samples)
+        print(f"[infer] sample_ids_file={args.sample_ids_file} matched={len(samples)}/{before} missing={missing}")
     if args.limit is not None:
         samples = samples[: args.limit]
     output_path = Path(args.output) if args.output else result_path(config.outputs_dir, args.experiment, "predictions.jsonl")
     summary_path = output_path.with_suffix(".summary.json")
+    trace_dir = output_path.parent / "traces"
     seen = set()
+    if output_path.exists() and args.no_resume:
+        output_path.unlink()
     if output_path.exists() and not args.no_resume:
         with output_path.open("r", encoding="utf-8") as f:
             for line in f:
@@ -66,7 +79,8 @@ def main() -> None:
         f"pending={len(pending_samples)} skipped={skipped} max_workers={max_workers} output={output_path}"
     )
     completed = 0
-    failed = 0
+    hard_failed = 0
+    warning_samples = 0
     start = time.perf_counter()
     progress = tqdm(pending_samples, desc="agent生成", unit="sample")
     if max_workers == 1:
@@ -79,8 +93,11 @@ def main() -> None:
             except Exception as exc:  # noqa: BLE001
                 row = _failed_result(sample, exc, time.perf_counter() - started)
             append_jsonl(output_path, row)
-            if row.get("errors"):
-                failed += 1
+            _write_trace(trace_dir, row)
+            if _is_hard_failed(row):
+                hard_failed += 1
+            elif row.get("errors"):
+                warning_samples += 1
             completed += 1
             _update_progress(progress, row)
     else:
@@ -98,8 +115,11 @@ def main() -> None:
                 except Exception as exc:  # noqa: BLE001
                     row = _failed_result(sample, exc, 0.0)
                 append_jsonl(output_path, row)
-                if row.get("errors"):
-                    failed += 1
+                _write_trace(trace_dir, row)
+                if _is_hard_failed(row):
+                    hard_failed += 1
+                elif row.get("errors"):
+                    warning_samples += 1
                 completed += 1
                 _update_progress(progress, row)
                 progress.update(1)
@@ -112,8 +132,11 @@ def main() -> None:
             "requested_samples": len(samples),
             "skipped_by_resume": skipped,
             "new_completed": completed,
-            "failed": failed,
+            "failed": hard_failed,
+            "hard_failed": hard_failed,
+            "warning_samples": warning_samples,
             "output": str(output_path),
+            "trace_dir": str(trace_dir),
             "model": config.agent_model,
             "web_enabled": bool(config.raw.get("agent", {}).get("enable_web_search")),
             "max_workers": max_workers,
@@ -121,7 +144,7 @@ def main() -> None:
         },
     )
     print(
-        f"[infer] finished completed={completed} failed={failed} skipped={skipped} "
+        f"[infer] finished completed={completed} failed={hard_failed} warnings={warning_samples} skipped={skipped} "
         f"elapsed={elapsed:.2f}s summary={summary_path}"
     )
 
@@ -151,6 +174,68 @@ def _failed_result(sample: Any, exc: Exception, elapsed: float) -> dict[str, Any
         "token_usage": {},
         "errors": [str(exc)],
         "plan": None,
+    }
+
+
+def _is_hard_failed(row: dict[str, Any]) -> bool:
+    if not row.get("errors"):
+        return False
+    if not str(row.get("answer") or "").strip():
+        return True
+    if str(row.get("reasoning_summary") or "").startswith("inference failed before final answer generation"):
+        return True
+    return False
+
+
+def _write_trace(trace_dir: Path, row: dict[str, Any]) -> None:
+    sample_id = str(row.get("sample_id") or "unknown")
+    trace_payload = {
+        "sample_id": sample_id,
+        "question": row.get("question", ""),
+        "answer": row.get("answer", ""),
+        "plan": row.get("plan"),
+        "reasoning_summary": row.get("reasoning_summary", ""),
+        "tools_used": row.get("tools_used", []),
+        "web_searched": row.get("web_searched", False),
+        "elapsed_seconds": row.get("elapsed_seconds", 0.0),
+        "token_usage": row.get("token_usage", {}),
+        "errors": row.get("errors", []),
+        "tool_trace": row.get("tool_trace", []),
+        "trace_stats": _trace_stats(row),
+    }
+    write_json(trace_dir / f"{sample_id}.trace.json", trace_payload)
+
+
+def _trace_stats(row: dict[str, Any]) -> dict[str, Any]:
+    events = row.get("tool_trace", []) or []
+    planner_events = [event for event in events if event.get("tool_name") == "agent_planner"]
+    search_events = [event for event in events if event.get("tool_name") == "web_search"]
+    return {
+        "event_count": len(events),
+        "successful_events": sum(1 for event in events if event.get("success")),
+        "failed_events": sum(1 for event in events if not event.get("success")),
+        "tool_sequence": [event.get("tool_name") for event in events],
+        "action_sequence": [
+            event.get("outputs", {}).get("action") or event.get("action")
+            for event in events
+        ],
+        "recoverable_error_count": sum(
+            1 for event in events if event.get("outputs", {}).get("recoverable_error")
+        ),
+        "planner_events": [
+            {
+                "action": event.get("action"),
+                "summary": event.get("summary"),
+                "outputs": event.get("outputs", {}),
+            }
+            for event in planner_events
+        ],
+        "search_event_count": len(search_events),
+        "search_queries": [
+            event.get("inputs", {}).get("query")
+            for event in search_events
+            if event.get("inputs", {}).get("query")
+        ],
     }
 
 

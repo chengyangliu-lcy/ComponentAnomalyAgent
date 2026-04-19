@@ -78,6 +78,10 @@ class AgentPlan:
     needs_web_search: bool
     queries: List[str]
     steps: List[str]
+    strategy: str = ""
+    selected_actions: List[Dict[str, Any]] = field(default_factory=list)
+    final_stop_reason: str = ""
+    budgets: Dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> Dict[str, Any]:
         return asdict(self)
@@ -111,4 +115,3 @@ class InferenceResult:
             "errors": self.errors,
             "plan": self.plan.to_json() if self.plan else None,
         }
-

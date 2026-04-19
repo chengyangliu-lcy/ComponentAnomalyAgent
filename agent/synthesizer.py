@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import base64
+import re
 from pathlib import Path
 from typing import Any, Dict, List
 
+from agent.prompts import FINAL_ANSWER_SYSTEM_PROMPT, build_final_answer_user_prompt
 from llm_client import LLMClient
 from schemas import Evidence, StandardSample
 from tools.utils import compact_text
@@ -25,7 +27,11 @@ class AnswerSynthesizer:
             f"[{idx}] {item.title}\n来源: {item.source}\n{compact_text(item.content, 1200)}"
             for idx, item in enumerate(evidence[:6], 1)
         )
-        user_text = f"问题：\n{sample.question_text}\n\n证据：\n{evidence_text or '无外部证据'}\n\n请输出中文技术答案。"
+        user_text = build_final_answer_user_prompt(
+            sample.question_text,
+            evidence_text,
+            _question_hints(sample.question_text),
+        )
         user_content: str | list[dict[str, Any]]
         if self.send_images:
             content: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
@@ -40,10 +46,7 @@ class AnswerSynthesizer:
         messages = [
             {
                 "role": "system",
-                "content": (
-                    "你是电子工程和组件异常分析专家。基于问题、图片说明和检索证据回答。"
-                    "答案要给出结论、原因、检查步骤和处理建议；不要编造证据中没有的精确数值。"
-                ),
+                "content": FINAL_ANSWER_SYSTEM_PROMPT,
             },
             {
                 "role": "user",
@@ -96,3 +99,10 @@ class AnswerSynthesizer:
             return f"data:{mime};base64,{encoded}"
         except Exception:
             return None
+
+
+def _question_hints(text: str) -> list[str]:
+    tokens = re.findall(r"[A-Za-z]{1,8}\d{0,5}[A-Za-z0-9_.+-]*|\d+(?:\.\d+)?\s*[A-Za-zΩμ%]*|[\u4e00-\u9fff]{2,}", text or "")
+    stop = {"请教", "问题", "为什么", "怎么", "处理", "以及", "这个", "电路", "作用", "哪些"}
+    cleaned = [token.strip() for token in tokens if token.strip() and token.strip() not in stop]
+    return list(dict.fromkeys(cleaned))[:12]
