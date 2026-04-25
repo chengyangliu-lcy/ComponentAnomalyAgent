@@ -26,6 +26,7 @@ from schemas import Evidence, StandardSample, ToolEvent
 from tools.utils import compact_text, timer
 from tools.web_reader import WebReader
 from tools.web_search import WebSearch
+from tools.openhands_browser import OpenHandsBrowserConfig, OpenHandsBrowserFetcher
 
 try:
     os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
@@ -401,8 +402,25 @@ class RobustWebReadExecutor(BaseEvidenceExecutor):
     tool_name = "web_reader"
     action_name = "read_or_keep_snippet"
 
-    def __init__(self, timeout: int = 20) -> None:
+    def __init__(
+        self,
+        timeout: int = 20,
+        enable_openhands_browser_primary: bool = True,
+        openhands_browser_timeout_seconds: float | None = None,
+        openhands_browser_max_chars: int = 6000,
+        openhands_browser_require_installed: bool = True,
+        openhands_browser: Any | None = None,
+    ) -> None:
         self.reader = WebReader(timeout=timeout)
+        self.enable_openhands_browser_primary = enable_openhands_browser_primary
+        self.openhands_browser_max_chars = openhands_browser_max_chars
+        self.openhands_browser = openhands_browser or OpenHandsBrowserFetcher(
+            OpenHandsBrowserConfig(
+                timeout_seconds=float(openhands_browser_timeout_seconds or timeout),
+                max_chars=openhands_browser_max_chars,
+                require_installed=openhands_browser_require_installed,
+            )
+        )
 
     def __call__(self, action: WebReadAction, conversation: Any = None) -> EvidenceObservation:
         run = self.run(action.url, action.title, action.snippet)
@@ -418,20 +436,67 @@ class RobustWebReadExecutor(BaseEvidenceExecutor):
         if lowered.endswith(".pdf") or "/pdf/" in lowered or self._should_keep_snippet_without_fetch(lowered):
             evidence = _search_evidence("", "snippet", title or url, url, snippet, 0.0)
             evidence.metadata["read_skipped"] = "pdf_binary_or_known_slow"
-            return ToolRun([evidence], summary="kept search snippet for pdf/binary/known-slow page")
+            evidence.metadata["read_backend"] = "snippet_fallback"
+            return ToolRun(
+                [evidence],
+                summary="kept search snippet for pdf/binary/known-slow page",
+                metadata={"read_backend": "snippet_fallback"},
+            )
+
+        openhands_error = None
+        if self.enable_openhands_browser_primary:
+            browser_result = self.openhands_browser.fetch(url, max_chars=self.openhands_browser_max_chars)
+            if browser_result.evidence:
+                browser_result.evidence.title = title or browser_result.evidence.title or url
+                browser_result.evidence.metadata["read_backend"] = "openhands_browser"
+                return ToolRun(
+                    [browser_result.evidence],
+                    summary=f"read page with OpenHands browser {url}",
+                    metadata={"read_backend": "openhands_browser"},
+                )
+            openhands_error = browser_result.error
+
         page = self.reader.read(url, max_chars=6000)
         if page.evidence:
-            return ToolRun([page.evidence], summary=f"read page {url}")
+            page.evidence.metadata["read_backend"] = "requests_bs4"
+            if openhands_error:
+                page.evidence.metadata["openhands_error"] = openhands_error
+            return ToolRun(
+                [page.evidence],
+                summary=f"read page {url}",
+                errors=[openhands_error] if openhands_error else [],
+                metadata={"read_backend": "requests_bs4", "openhands_error": openhands_error},
+            )
         if snippet:
             evidence = _search_evidence("", "snippet", title or url, url, snippet, 0.0)
             evidence.metadata["read_error"] = page.error
+            evidence.metadata["web_reader_error"] = page.error
+            evidence.metadata["openhands_error"] = openhands_error
+            evidence.metadata["read_backend"] = "snippet_fallback"
+            errors = [error for error in [openhands_error, page.error or "read failed"] if error]
             return ToolRun(
                 [evidence],
                 summary="page read failed; kept search snippet",
                 success=True,
-                errors=[page.error or "read failed"],
+                errors=errors,
+                metadata={
+                    "read_backend": "snippet_fallback",
+                    "openhands_error": openhands_error,
+                    "web_reader_error": page.error,
+                },
             )
-        return ToolRun([], summary=f"page read failed {url}", success=False, errors=[page.error or "read failed"])
+        errors = [error for error in [openhands_error, page.error or "read failed"] if error]
+        return ToolRun(
+            [],
+            summary=f"page read failed {url}",
+            success=False,
+            errors=errors,
+            metadata={
+                "read_backend": "failed",
+                "openhands_error": openhands_error,
+                "web_reader_error": page.error,
+            },
+        )
 
     def _should_keep_snippet_without_fetch(self, lowered_url: str) -> bool:
         slow_or_blocked_hosts = (
@@ -441,6 +506,10 @@ class RobustWebReadExecutor(BaseEvidenceExecutor):
             "st.com/en/",
         )
         return any(marker in lowered_url for marker in slow_or_blocked_hosts)
+
+    def close(self) -> None:
+        if hasattr(self.openhands_browser, "close"):
+            self.openhands_browser.close()
 
 
 class DomainSkillExecutor(BaseEvidenceExecutor):

@@ -10,6 +10,7 @@ from unittest.mock import patch
 import yaml
 
 from schemas import Evidence
+from tools.browser import BrowserFetchResult
 from tools.evidence_tools import (
     APIWebSearchExecutor,
     DomainSkillExecutor,
@@ -39,6 +40,16 @@ class CaptureLLM:
     def chat(self, messages, temperature=None):
         self.messages = messages
         return SimpleNamespace(content="结论：测试答案", error=None)
+
+
+class FakeBrowser:
+    def __init__(self, result: BrowserFetchResult) -> None:
+        self.result = result
+        self.calls: list[tuple[str, int | None]] = []
+
+    def fetch(self, url: str, max_chars: int | None = None) -> BrowserFetchResult:
+        self.calls.append((url, max_chars))
+        return self.result
 
 
 class EvidenceToolTests(unittest.TestCase):
@@ -147,7 +158,7 @@ class EvidenceToolTests(unittest.TestCase):
         self.assertEqual(run.evidence[0].source, "https://direct.example.com")
 
     def test_web_read_keeps_snippet_on_page_failure(self) -> None:
-        executor = RobustWebReadExecutor()
+        executor = RobustWebReadExecutor(enable_openhands_browser_primary=False)
         executor.reader.read = lambda url, max_chars=6000: SimpleNamespace(evidence=None, error="403 forbidden")
 
         run = executor.run("https://example.com/blocked", "Blocked page", "important snippet")
@@ -155,6 +166,72 @@ class EvidenceToolTests(unittest.TestCase):
         self.assertTrue(run.success)
         self.assertIn("important snippet", run.evidence[0].content)
         self.assertEqual(run.evidence[0].metadata["read_error"], "403 forbidden")
+
+    def test_web_read_prefers_openhands_browser(self) -> None:
+        browser_evidence = Evidence(
+            source="https://example.com/page",
+            title="Browser page",
+            content="browser extracted content",
+            metadata={"kind": "openhands_browser_page"},
+        )
+        browser = FakeBrowser(BrowserFetchResult(browser_evidence))
+        executor = RobustWebReadExecutor(openhands_browser=browser)
+        executor.reader.read = lambda url, max_chars=6000: self.fail("WebReader should not be called")
+
+        run = executor.run("https://example.com/page", "Preferred title", "snippet")
+
+        self.assertTrue(run.success)
+        self.assertEqual(run.evidence[0].content, "browser extracted content")
+        self.assertEqual(run.evidence[0].title, "Preferred title")
+        self.assertEqual(run.evidence[0].metadata["kind"], "openhands_browser_page")
+        self.assertEqual(run.metadata["read_backend"], "openhands_browser")
+        self.assertEqual(browser.calls, [("https://example.com/page", 6000)])
+
+    def test_web_read_falls_back_to_requests_when_openhands_unavailable(self) -> None:
+        browser = FakeBrowser(BrowserFetchResult(None, "chromium missing"))
+        executor = RobustWebReadExecutor(openhands_browser=browser)
+        executor.reader.read = lambda url, max_chars=6000: SimpleNamespace(
+            evidence=Evidence(
+                source=url,
+                title="Requests page",
+                content="requests content",
+                metadata={"kind": "web_page"},
+            ),
+            error=None,
+        )
+
+        run = executor.run("https://example.com/readable", "Readable page", "snippet")
+
+        self.assertTrue(run.success)
+        self.assertEqual(run.evidence[0].metadata["read_backend"], "requests_bs4")
+        self.assertEqual(run.evidence[0].metadata["openhands_error"], "chromium missing")
+        self.assertEqual(run.metadata["read_backend"], "requests_bs4")
+
+    def test_web_read_keeps_snippet_after_openhands_and_requests_fail(self) -> None:
+        browser = FakeBrowser(BrowserFetchResult(None, "browser failed"))
+        executor = RobustWebReadExecutor(openhands_browser=browser)
+        executor.reader.read = lambda url, max_chars=6000: SimpleNamespace(evidence=None, error="403 forbidden")
+
+        run = executor.run("https://example.com/blocked", "Blocked page", "important snippet")
+
+        self.assertTrue(run.success)
+        self.assertEqual(run.evidence[0].metadata["read_backend"], "snippet_fallback")
+        self.assertEqual(run.evidence[0].metadata["openhands_error"], "browser failed")
+        self.assertEqual(run.evidence[0].metadata["web_reader_error"], "403 forbidden")
+        self.assertIn("browser failed", run.errors)
+        self.assertIn("403 forbidden", run.errors)
+
+    def test_web_read_skips_openhands_for_pdf_or_known_slow_pages(self) -> None:
+        browser = FakeBrowser(BrowserFetchResult(None, "should not be called"))
+        executor = RobustWebReadExecutor(openhands_browser=browser)
+        executor.reader.read = lambda url, max_chars=6000: self.fail("WebReader should not be called")
+
+        run = executor.run("https://example.com/file.pdf", "PDF", "pdf snippet")
+
+        self.assertTrue(run.success)
+        self.assertEqual(browser.calls, [])
+        self.assertEqual(run.evidence[0].metadata["read_backend"], "snippet_fallback")
+        self.assertEqual(run.evidence[0].metadata["read_skipped"], "pdf_binary_or_known_slow")
 
     def test_image_inspect_uses_mock_llm(self) -> None:
         with _workspace_tempdir() as tmp:

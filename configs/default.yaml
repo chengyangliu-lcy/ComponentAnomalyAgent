@@ -36,6 +36,10 @@ agent:
   vision_timeout_seconds: 35
   final_answer_timeout_seconds: 60
   web_read_timeout_seconds: 15
+  enable_openhands_browser_primary: true
+  openhands_browser_timeout_seconds: 15
+  openhands_browser_max_chars: 6000
+  openhands_browser_require_installed: true
   max_consecutive_tool_errors: 3
   max_planner_failures: 2
   tool_concurrency_limit: 4

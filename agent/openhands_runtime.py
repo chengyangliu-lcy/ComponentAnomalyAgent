@@ -152,7 +152,13 @@ class OpenHandsEvidenceRuntime:
             skill_path=self._skill_path(),
             forbidden_roots=[config.image_root, config.dataset_path.parent / "2025"],
         )
-        self.read_tool = RobustWebReadExecutor(timeout=web_read_timeout)
+        self.read_tool = RobustWebReadExecutor(
+            timeout=web_read_timeout,
+            enable_openhands_browser_primary=bool(self.agent_cfg.get("enable_openhands_browser_primary", True)),
+            openhands_browser_timeout_seconds=float(self.agent_cfg.get("openhands_browser_timeout_seconds", web_read_timeout)),
+            openhands_browser_max_chars=int(self.agent_cfg.get("openhands_browser_max_chars", 6000)),
+            openhands_browser_require_installed=bool(self.agent_cfg.get("openhands_browser_require_installed", True)),
+        )
         self.rank_tool = EvidenceRankExecutor()
         self.finish_tool = FinishAnswerExecutor(self.answer_llm)
 

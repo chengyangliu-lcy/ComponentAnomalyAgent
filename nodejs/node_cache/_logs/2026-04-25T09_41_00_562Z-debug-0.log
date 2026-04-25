@@ -1,0 +1,16 @@
+0 verbose cli D:\nodejs\node.exe D:\nodejs\node_modules\npm\bin\npm-cli.js
+1 info using npm@11.6.2
+2 info using node@v24.13.0
+3 silly config load:file:D:\nodejs\node_modules\npm\npmrc
+4 silly config load:file:C:\Users\SCO\.npmrc
+5 silly config load:file:d:\xinyang\xinyang\ComponentAnomalyAgent\nodejs\node_global\etc\npmrc
+6 verbose title npm root
+7 verbose argv "root" "--global"
+8 verbose logfile logs-max:10 dir:d:\xinyang\xinyang\ComponentAnomalyAgent\nodejs\node_cache\_logs\2026-04-25T09_41_00_562Z-
+9 verbose logfile d:\xinyang\xinyang\ComponentAnomalyAgent\nodejs\node_cache\_logs\2026-04-25T09_41_00_562Z-debug-0.log
+10 verbose cwd D:\xinyang\xinyang\ComponentAnomalyAgent
+11 verbose os Windows_NT 10.0.26200
+12 verbose node v24.13.0
+13 verbose npm  v11.6.2
+14 verbose exit 0
+15 info ok
