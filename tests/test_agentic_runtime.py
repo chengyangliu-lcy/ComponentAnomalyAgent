@@ -7,6 +7,8 @@ import unittest
 from uuid import uuid4
 
 from agent.openhands_runtime import OpenHandsEvidenceRuntime
+from agent.prompts import PLANNER_SYSTEM_PROMPT
+from agent.tool_registry import DEFAULT_TOOL_REGISTRY
 from configs.config import RuntimeConfig
 from schemas import ImageRef, StandardSample
 from tools.evidence_tools import ToolRun
@@ -46,7 +48,57 @@ class FakeImageTool:
         )
 
 
+class FakeSearchTool:
+    def __init__(self, evidence: list[Evidence] | None = None) -> None:
+        self.calls: list[dict] = []
+        self.evidence = evidence or [
+            Evidence(
+                source="https://example.com/tl431",
+                title="TL431 feedback note",
+                content="TL431 optocoupler ripple troubleshooting",
+                metadata={"kind": "web_search_result"},
+            )
+        ]
+
+    def run(self, query, limit=6):
+        self.calls.append({"query": query, "limit": limit})
+        return ToolRun(evidence=list(self.evidence), summary="fake search ok")
+
+
+class FakeReadTool:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def run(self, url, title="", snippet=""):
+        self.calls.append({"url": url, "title": title, "snippet": snippet})
+        return ToolRun(
+            evidence=[
+                Evidence(
+                    source=url,
+                    title=title or url,
+                    content=snippet or "page content",
+                    metadata={"kind": "web_page"},
+                )
+            ],
+            summary="fake read ok",
+        )
+
+
+class FakeFinishTool:
+    def __init__(self, answer: str = "fallback synthesized answer") -> None:
+        self.calls: list[dict] = []
+        self.answer = answer
+
+    def run(self, question, evidence, allow_llm=True):
+        self.calls.append({"question": question, "allow_llm": allow_llm, "evidence_count": len(evidence)})
+        return ToolRun(text=self.answer, summary="fake finish ok")
+
+
 class AgenticRuntimeTests(unittest.TestCase):
+    def test_prompt_and_registry_tool_names_stay_in_sync(self) -> None:
+        for tool_name in DEFAULT_TOOL_REGISTRY.planner_tool_names():
+            self.assertIn(tool_name, PLANNER_SYSTEM_PROMPT)
+
     def test_scripted_valid_actions_drive_loop(self) -> None:
         with self._runtime() as runtime:
             runtime.llm = ScriptedPlanner(
@@ -151,6 +203,86 @@ class AgenticRuntimeTests(unittest.TestCase):
         self.assertEqual(len(domain_events), 1)
         self.assertTrue(result.answer)
 
+    def test_web_search_query_is_repaired_and_limit_is_clipped(self) -> None:
+        with self._runtime(
+            agent_overrides={"enable_web_search": True},
+            web_overrides={"max_results_per_query": 2},
+        ) as runtime:
+            runtime.llm = ScriptedPlanner(
+                [
+                    {"tool_name": "web_search", "args": {"query": "原因 处理", "limit": 99}, "reason": "need public evidence"},
+                    {"tool_name": "finish_answer", "args": {}, "reason": "done", "stop": True},
+                ]
+            )
+            fake_search = FakeSearchTool()
+            runtime.search_tool = fake_search
+
+            result = runtime.run_sample(self._sample("TL431 光耦反馈纹波异常怎么处理"))
+
+        self.assertEqual(fake_search.calls[0]["limit"], 2)
+        self.assertIn("TL431", fake_search.calls[0]["query"])
+        planner_event = next(event for event in result.tool_trace if event.tool_name == "agent_planner" and event.action == "select_action")
+        self.assertTrue(planner_event.outputs["repair_notes"]["repair_applied"])
+        self.assertEqual(result.plan.selected_actions[0]["repaired"], True)
+
+    def test_web_read_missing_url_selects_best_candidate(self) -> None:
+        with self._runtime(
+            agent_overrides={"enable_web_search": True},
+            web_overrides={"max_results_per_query": 2},
+        ) as runtime:
+            runtime.llm = ScriptedPlanner(
+                [
+                    {"tool_name": "web_search", "args": {"query": ""}, "reason": "search"},
+                    {"tool_name": "web_read", "args": {}, "reason": "read strongest page"},
+                    {"tool_name": "finish_answer", "args": {}, "reason": "done", "stop": True},
+                ]
+            )
+            runtime.search_tool = FakeSearchTool(
+                [
+                    Evidence(
+                        source="https://example.com/appnote",
+                        title="Application note",
+                        content="current sense spike filtering details",
+                        metadata={"kind": "web_search_result"},
+                    )
+                ]
+            )
+            fake_read = FakeReadTool()
+            runtime.read_tool = fake_read
+            runtime._forced_action = lambda state: None
+
+            result = runtime.run_sample(self._sample("电流采样尖峰和滤波怎么处理"))
+
+        self.assertEqual(fake_read.calls[0]["url"], "https://example.com/appnote")
+        self.assertEqual(result.plan.selected_actions[1]["repaired"], True)
+        web_read_event = next(event for event in result.tool_trace if event.tool_name == "web_reader")
+        self.assertEqual(web_read_event.outputs["effective_action"]["args"]["url"], "https://example.com/appnote")
+
+    def test_blank_finish_answer_falls_back_to_finish_tool_and_trace_keeps_all_action_forms(self) -> None:
+        with self._runtime() as runtime:
+            runtime.llm = ScriptedPlanner(
+                [
+                    {"tool_name": "match_domain_skill", "args": {}, "reason": "get prior"},
+                    {"tool_name": "finish_answer", "args": {"answer": ""}, "reason": "done", "stop": True},
+                ]
+            )
+            fake_finish = FakeFinishTool(answer="synthesized from evidence")
+            runtime.finish_tool = fake_finish
+
+            result = runtime.run_sample(self._sample("LED feedback troubleshooting"))
+
+        self.assertEqual(result.answer, "synthesized from evidence")
+        self.assertEqual(fake_finish.calls[0]["evidence_count"], 1)
+        finish_planner_event = [
+            event
+            for event in result.tool_trace
+            if event.tool_name == "agent_planner" and event.outputs.get("action") == "finish_answer"
+        ][0]
+        self.assertIn("raw_action", finish_planner_event.outputs)
+        self.assertIn("validated_action", finish_planner_event.outputs)
+        self.assertIn("effective_action", finish_planner_event.outputs)
+        self.assertTrue(result.plan.selected_actions[-1]["repaired"])
+
     def test_trace_payload_written_as_parseable_json(self) -> None:
         from scripts.run_infer import _write_trace
 
@@ -174,8 +306,13 @@ class AgenticRuntimeTests(unittest.TestCase):
         self.assertEqual(payload["sample_id"], "sample")
         self.assertIn("\ufffd", payload["question"])
 
-    def _runtime(self, image_root: Path | None = None):
-        return _RuntimeContext(image_root=image_root)
+    def _runtime(
+        self,
+        image_root: Path | None = None,
+        agent_overrides: dict | None = None,
+        web_overrides: dict | None = None,
+    ):
+        return _RuntimeContext(image_root=image_root, agent_overrides=agent_overrides, web_overrides=web_overrides)
 
     def _sample(self, question: str, images: list[ImageRef] | None = None) -> StandardSample:
         return StandardSample(
@@ -198,12 +335,19 @@ def _workspace_tempdir():
 
 
 class _RuntimeContext:
-    def __init__(self, image_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        image_root: Path | None = None,
+        agent_overrides: dict | None = None,
+        web_overrides: dict | None = None,
+    ) -> None:
         self.temp_dir = _workspace_tempdir()
         self.root: Path | None = None
         self.image_root_override = image_root
         self.image_root: Path | None = None
         self.runtime: OpenHandsEvidenceRuntime | None = None
+        self.agent_overrides = agent_overrides or {}
+        self.web_overrides = web_overrides or {}
 
     def __enter__(self) -> OpenHandsEvidenceRuntime:
         self.root = Path(self.temp_dir.__enter__())
@@ -271,6 +415,8 @@ skills:
             },
             "runtime": {"request_timeout_seconds": 1},
         }
+        raw["agent"].update(self.agent_overrides)
+        raw["web"].update(self.web_overrides)
         self.runtime = OpenHandsEvidenceRuntime(RuntimeConfig(raw))
         return self.runtime
 

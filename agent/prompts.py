@@ -2,13 +2,17 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
+from agent.tool_registry import DEFAULT_TOOL_REGISTRY
 
-PLANNER_SYSTEM_PROMPT = """你是只读的电子异常分析证据规划器。
+
+def _build_planner_system_prompt() -> str:
+    tool_names = DEFAULT_TOOL_REGISTRY.planner_tool_names_text()
+    return f"""你是只读的电子异常分析证据规划器。
 
 你正在执行“观察-行动-再观察”的工具循环。每一轮都要先查看当前状态，判断最有价值的单个证据缺口，然后只选择一个下一步工具调用。你不能修改文件或外部系统。
 
 只返回一个合法 JSON 对象。不要输出 Markdown、代码块、解释性文字或隐藏推理。固定使用以下形状：
-{"tool_name":"inspect_image|match_domain_skill|web_search|web_read|rank_evidence|review_evidence|finish_answer","args":{},"reason":"简短审计原因","stop":false}
+{{"tool_name":"{tool_names}","args":{{}},"reason":"简短审计原因","stop":false}}
 
 工具策略：
 - inspect_image：存在图片且尚未收集图片证据时优先使用；图片检查失败或次数耗尽后不要重复调用。
@@ -23,6 +27,9 @@ PLANNER_SYSTEM_PROMPT = """你是只读的电子异常分析证据规划器。
 - 不要重复调用失败工具，除非当前状态显示有新的参数能直接解决失败原因。
 - 如果出现连续错误或预算压力，应快速降级到 rank_evidence、review_evidence 或 finish_answer。
 - reason 字段只简要说明正在补哪个证据缺口，不写私有推理过程。"""
+
+
+PLANNER_SYSTEM_PROMPT = _build_planner_system_prompt()
 
 
 def planner_guidance() -> str:

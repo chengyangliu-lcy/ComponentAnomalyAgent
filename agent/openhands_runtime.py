@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from agent.prompts import PLANNER_SYSTEM_PROMPT, planner_guidance
+from agent.tool_argument_repair import RepairNotes, repair_action_args
+from agent.tool_registry import DEFAULT_TOOL_REGISTRY, ToolSpec
 from configs.config import RuntimeConfig
 from llm_client import LLMClient
 from schemas import AgentPlan, Evidence, InferenceResult, StandardSample, ToolEvent
@@ -25,17 +27,6 @@ from tools.evidence_tools import (
 )
 from tools.logger import TraceLogger
 from tools.utils import compact_text, timer
-
-
-ALLOWED_TOOLS = {
-    "inspect_image",
-    "match_domain_skill",
-    "web_search",
-    "web_read",
-    "rank_evidence",
-    "review_evidence",
-    "finish_answer",
-}
 
 DEFAULT_MAX_DOMAIN_SKILL_CALLS = 1
 
@@ -93,6 +84,7 @@ class OpenHandsEvidenceRuntime:
         self.config = config
         self.agent_cfg: dict[str, Any] = dict(config.raw.get("agent", {}))
         self.web_cfg: dict[str, Any] = dict(config.raw.get("web", {}))
+        self.tool_registry = DEFAULT_TOOL_REGISTRY
         model_cfg = config.raw.get("model", {})
         request_timeout = int(config.raw.get("runtime", {}).get("request_timeout_seconds", 20))
         tool_timeout = int(self.agent_cfg.get("tool_timeout_seconds", request_timeout))
@@ -207,7 +199,7 @@ class OpenHandsEvidenceRuntime:
                     raw_action, action_error = forced_action.to_json(), None
                 else:
                     raw_action, action_error = self._next_action(state, start, max_total_seconds)
-            action, validation_error = self._validate_action(raw_action)
+            action, spec, validation_error = self._validate_action(raw_action)
             if action_error or validation_error:
                 error = action_error or validation_error or "invalid planner action"
                 state.errors.append(error)
@@ -219,6 +211,9 @@ class OpenHandsEvidenceRuntime:
                         state,
                         raw_action,
                         action,
+                        None,
+                        None,
+                        spec,
                         observation,
                         start,
                         max_total_seconds,
@@ -228,13 +223,17 @@ class OpenHandsEvidenceRuntime:
                 )
                 continue
 
-            state.selected_actions.append(action.to_json())
+            effective_action, repair_notes = self._repair_action(action, state, start, max_total_seconds)
+            state.selected_actions.append(self._selected_action_record(action, effective_action, repair_notes))
             plan.selected_actions = state.selected_actions
             trace.add(
                 self._planner_event(
                     state,
                     raw_action,
                     action,
+                    effective_action,
+                    repair_notes,
+                    spec,
                     AgentObservation(True, "planner selected action"),
                     start,
                     max_total_seconds,
@@ -243,16 +242,25 @@ class OpenHandsEvidenceRuntime:
                 )
             )
 
-            guard_error = self._guard_action(state, action, start, max_total_seconds)
+            guard_error = self._guard_action(state, effective_action, start, max_total_seconds)
             if guard_error:
                 observation = AgentObservation(False, "runtime skipped unsafe or exhausted action", error=guard_error, recoverable=True)
                 state.observations.append(observation.to_json())
                 state.consecutive_errors += 1
                 state.errors.append(guard_error)
-                trace.add(self._guard_event(state, action, observation, start, max_total_seconds))
+                trace.add(self._guard_event(state, effective_action, spec, repair_notes, observation, start, max_total_seconds))
                 continue
 
-            event, observation = self._execute_action(state, action, start, max_total_seconds)
+            event, observation = self._execute_action(
+                state,
+                raw_action,
+                action,
+                effective_action,
+                spec,
+                repair_notes,
+                start,
+                max_total_seconds,
+            )
             trace.add(event)
             state.observations.append(observation.to_json())
             if observation.success:
@@ -261,7 +269,7 @@ class OpenHandsEvidenceRuntime:
                 state.consecutive_errors += 1
                 if observation.error:
                     state.errors.append(observation.error)
-            if action.stop or action.tool_name == "finish_answer":
+            if effective_action.stop or effective_action.tool_name == "finish_answer":
                 state.final_stop_reason = state.final_stop_reason or "finish_answer selected"
                 break
 
@@ -272,8 +280,19 @@ class OpenHandsEvidenceRuntime:
                 reason="fallback finalization after loop budget ended",
                 stop=True,
             )
-            state.selected_actions.append(action.to_json())
-            event, observation = self._execute_action(state, action, start, max_total_seconds)
+            spec = self.tool_registry.get(action.tool_name)
+            effective_action, repair_notes = self._repair_action(action, state, start, max_total_seconds)
+            state.selected_actions.append(self._selected_action_record(action, effective_action, repair_notes))
+            event, observation = self._execute_action(
+                state,
+                action.to_json(),
+                action,
+                effective_action,
+                spec,
+                repair_notes,
+                start,
+                max_total_seconds,
+            )
             trace.add(event)
             state.observations.append(observation.to_json())
             state.final_stop_reason = state.final_stop_reason or "fallback finish after loop"
@@ -341,28 +360,61 @@ class OpenHandsEvidenceRuntime:
         state.planner_failures = 0
         return payload, None
 
-    def _validate_action(self, payload: dict[str, Any]) -> tuple[AgentAction | None, str | None]:
+    def _validate_action(self, payload: dict[str, Any]) -> tuple[AgentAction | None, ToolSpec | None, str | None]:
         if not isinstance(payload, dict):
-            return None, "planner action must be a JSON object"
+            return None, None, "planner action must be a JSON object"
         tool_name = str(payload.get("tool_name") or payload.get("tool") or payload.get("action") or "").strip()
-        if tool_name not in ALLOWED_TOOLS:
-            return None, f"unknown planner tool: {tool_name or '<empty>'}"
+        if tool_name not in self.tool_registry.names():
+            return None, None, f"unknown planner tool: {tool_name or '<empty>'}"
+        if tool_name not in self.tool_registry.enabled_names(self.agent_cfg, self.web_cfg):
+            return None, self.tool_registry.get(tool_name), f"planner tool disabled by config: {tool_name}"
         args = payload.get("args") or {}
-        if not isinstance(args, dict):
-            return None, "planner action args must be a JSON object"
+        spec = self.tool_registry.get(tool_name)
+        error = spec.validate_args(args)
+        if error:
+            return None, spec, error
         reason = compact_text(str(payload.get("reason") or ""), 500)
-        return AgentAction(tool_name=tool_name, args=args, reason=reason, stop=bool(payload.get("stop"))), None
+        return AgentAction(tool_name=tool_name, args=dict(args), reason=reason, stop=bool(payload.get("stop"))), spec, None
+
+    def _repair_action(
+        self,
+        action: AgentAction,
+        state: AgentState,
+        start: float,
+        max_total_seconds: float,
+    ) -> tuple[AgentAction, RepairNotes]:
+        repaired_args, repair_notes = repair_action_args(
+            action.tool_name,
+            action.args,
+            question=state.sample.question_text,
+            evidence=state.evidence,
+            max_web_results=int(self.web_cfg.get("max_results_per_query", self.agent_cfg.get("max_web_results", 6))),
+            rank_limit=12,
+            next_seed_query=lambda: self._next_seed_query(state),
+            select_read_target=lambda url: self._select_read_target(state, url),
+            allow_llm=self._can_start_action("finish_answer", start, max_total_seconds),
+        )
+        return AgentAction(tool_name=action.tool_name, args=repaired_args, reason=action.reason, stop=action.stop), repair_notes
+
+    def _selected_action_record(self, validated_action: AgentAction, effective_action: AgentAction, repair_notes: RepairNotes) -> dict[str, Any]:
+        record = effective_action.to_json()
+        record["raw_args"] = dict(validated_action.args)
+        record["repaired"] = repair_notes.applied
+        record["repair_reasons"] = list(repair_notes.reasons)
+        return record
 
     def _execute_action(
         self,
         state: AgentState,
+        raw_action: dict[str, Any],
+        validated_action: AgentAction,
         action: AgentAction,
+        spec: ToolSpec,
+        repair_notes: RepairNotes,
         start: float,
         max_total_seconds: float,
     ) -> tuple[ToolEvent, AgentObservation]:
         before_evidence = len(state.evidence)
-        if action.tool_name == "finish_answer" and not self._can_start_action("finish_answer", start, max_total_seconds):
-            action.args["allow_llm"] = False
         with timer() as elapsed:
             run = self._run_tool(state, action)
         if action.tool_name == "rank_evidence" and run.evidence:
@@ -379,11 +431,15 @@ class OpenHandsEvidenceRuntime:
             summary=run.summary,
             evidence=[item.to_json() for item in run.evidence],
             error="; ".join(run.errors) if run.errors else None,
-            recoverable=action.tool_name != "finish_answer",
+            recoverable=spec.recoverable_by_default,
         )
         event = self._event_for_action(
             state,
+            raw_action,
+            validated_action,
             action,
+            spec,
+            repair_notes,
             run,
             elapsed["elapsed"],
             before_evidence,
@@ -410,17 +466,19 @@ class OpenHandsEvidenceRuntime:
         if action.tool_name == "web_search":
             if not bool(self.agent_cfg.get("enable_web_search", True)):
                 return ToolRun(summary="web search disabled by config", success=False, errors=["web search disabled"])
-            query = str(action.args.get("query") or self._next_seed_query(state)).strip()
+            query = str(action.args.get("query") or "").strip()
             if not query:
                 return ToolRun(summary="web search skipped: no query", success=False, errors=["no search query"])
             state.queries.append(query)
-            return self.search_tool.run(query, limit=int(self.web_cfg.get("max_results_per_query", self.agent_cfg.get("max_web_results", 6))))
+            return self.search_tool.run(query, limit=int(action.args.get("limit") or self.web_cfg.get("max_results_per_query", self.agent_cfg.get("max_web_results", 6))))
         if action.tool_name == "web_read":
             item = self._select_read_target(state, str(action.args.get("url") or ""))
             if item is None:
                 return ToolRun(summary="web read skipped: no unread URL", success=False, errors=["no unread URL"])
             state.read_urls.add(item.source)
-            return self.read_tool.run(item.source, item.title, item.content[:500])
+            title = str(action.args.get("title") or item.title or item.source)
+            snippet = str(action.args.get("snippet") or item.content[:500])
+            return self.read_tool.run(item.source, title, snippet)
         if action.tool_name == "rank_evidence":
             return self.rank_tool.run(question, state.evidence, max_items=int(action.args.get("max_items") or 12))
         if action.tool_name == "review_evidence":
@@ -593,7 +651,11 @@ class OpenHandsEvidenceRuntime:
     def _event_for_action(
         self,
         state: AgentState,
+        raw_action: dict[str, Any],
+        validated_action: AgentAction,
         action: AgentAction,
+        spec: ToolSpec,
+        repair_notes: RepairNotes,
         run: ToolRun,
         elapsed: float,
         before_evidence: int,
@@ -601,14 +663,22 @@ class OpenHandsEvidenceRuntime:
         start: float,
         max_total_seconds: float,
     ) -> ToolEvent:
-        tool_name, action_name = self._tool_event_names(action.tool_name)
         evidence_delta = len(state.evidence) - before_evidence
         outputs = {
             "sources": [item.source for item in run.evidence],
             "metadata": run.metadata,
             "iteration": state.iteration,
             "action": action.tool_name,
-            "validated_action": action.to_json(),
+            "raw_action": raw_action,
+            "validated_action": validated_action.to_json(),
+            "effective_action": action.to_json(),
+            "registry_tool": {
+                "name": spec.name,
+                "planner_name": spec.planner_name,
+                "event_tool_name": spec.event_tool_name,
+                "event_action_name": spec.event_action_name,
+            },
+            "repair_notes": repair_notes.to_json(),
             "observation": observation.to_json(),
             "evidence_delta": evidence_delta,
             "recoverable_error": observation.recoverable and not observation.success,
@@ -617,12 +687,12 @@ class OpenHandsEvidenceRuntime:
         if action.tool_name == "review_evidence":
             outputs.update(run.metadata)
         return ToolEvent(
-            tool_name=tool_name,
-            action=action_name,
+            tool_name=spec.event_tool_name,
+            action=spec.event_action_name,
             success=run.success,
             elapsed_seconds=elapsed,
             summary=run.summary,
-            inputs=self._inputs_for_action(state, action),
+            inputs=self._inputs_for_action(state, action, spec),
             outputs=outputs,
             error="; ".join(run.errors) if run.errors else None,
         )
@@ -631,7 +701,10 @@ class OpenHandsEvidenceRuntime:
         self,
         state: AgentState,
         raw_action: dict[str, Any],
-        action: AgentAction | None,
+        validated_action: AgentAction | None,
+        effective_action: AgentAction | None,
+        repair_notes: RepairNotes | None,
+        spec: ToolSpec | None,
         observation: AgentObservation,
         start: float,
         max_total_seconds: float,
@@ -643,17 +716,29 @@ class OpenHandsEvidenceRuntime:
             action="select_action",
             success=success,
             elapsed_seconds=elapsed,
-            summary=observation.summary if not success else f"selected {action.tool_name if action else '<none>'}",
+            summary=observation.summary if not success else f"selected {effective_action.tool_name if effective_action else '<none>'}",
             inputs={
                 "sample_id": state.sample.sample_id,
                 "iteration": state.iteration,
-                "allowed_tools": sorted(ALLOWED_TOOLS),
+                "allowed_tools": self.tool_registry.enabled_names(self.agent_cfg, self.web_cfg),
             },
             outputs={
                 "iteration": state.iteration,
-                "action": action.tool_name if action else None,
+                "action": effective_action.tool_name if effective_action else None,
                 "raw_action": raw_action,
-                "validated_action": action.to_json() if action else None,
+                "validated_action": validated_action.to_json() if validated_action else None,
+                "effective_action": effective_action.to_json() if effective_action else None,
+                "registry_tool": (
+                    {
+                        "name": spec.name,
+                        "planner_name": spec.planner_name,
+                        "event_tool_name": spec.event_tool_name,
+                        "event_action_name": spec.event_action_name,
+                    }
+                    if spec
+                    else None
+                ),
+                "repair_notes": repair_notes.to_json() if repair_notes else None,
                 "observation": observation.to_json(),
                 "evidence_count": len(state.evidence),
                 "budget_remaining": self._budget_remaining(start, max_total_seconds),
@@ -665,6 +750,8 @@ class OpenHandsEvidenceRuntime:
         self,
         state: AgentState,
         action: AgentAction,
+        spec: ToolSpec,
+        repair_notes: RepairNotes,
         observation: AgentObservation,
         start: float,
         max_total_seconds: float,
@@ -682,6 +769,14 @@ class OpenHandsEvidenceRuntime:
             outputs={
                 "iteration": state.iteration,
                 "validated_action": action.to_json(),
+                "effective_action": action.to_json(),
+                "registry_tool": {
+                    "name": spec.name,
+                    "planner_name": spec.planner_name,
+                    "event_tool_name": spec.event_tool_name,
+                    "event_action_name": spec.event_action_name,
+                },
+                "repair_notes": repair_notes.to_json(),
                 "observation": observation.to_json(),
                 "recoverable_error": True,
                 "budget_remaining": self._budget_remaining(start, max_total_seconds),
@@ -689,32 +784,38 @@ class OpenHandsEvidenceRuntime:
             error=observation.error,
         )
 
-    def _inputs_for_action(self, state: AgentState, action: AgentAction) -> dict[str, Any]:
-        if action.tool_name == "inspect_image":
-            return {"sample_id": state.sample.sample_id, "images": state.image_paths, "reason": action.reason}
-        if action.tool_name == "match_domain_skill":
-            return {"sample_id": state.sample.sample_id, "reason": action.reason}
-        if action.tool_name == "web_search":
-            return {
-                "query": action.args.get("query") or (state.queries[-1] if state.queries else ""),
-                "limit": int(self.web_cfg.get("max_results_per_query", self.agent_cfg.get("max_web_results", 6))),
-                "reason": action.reason,
-            }
-        if action.tool_name == "web_read":
-            return {"url": action.args.get("url") or "", "reason": action.reason}
-        return {"sample_id": state.sample.sample_id, "reason": action.reason}
-
-    def _tool_event_names(self, tool_name: str) -> tuple[str, str]:
-        mapping = {
-            "inspect_image": ("image_inspect", "multimodal_component_extract"),
-            "match_domain_skill": ("domain_skill", "match_electronics_skills"),
-            "web_search": ("web_search", "api_or_html_search"),
-            "web_read": ("web_reader", "read_or_keep_snippet"),
-            "rank_evidence": ("evidence_rank", "rank_and_dedupe"),
-            "review_evidence": ("circuit_reviewer", "coverage_check"),
-            "finish_answer": ("finish_answer", "synthesize_final_answer"),
+    def _inputs_for_action(self, state: AgentState, action: AgentAction, spec: ToolSpec) -> dict[str, Any]:
+        sanitized_args = {key: value for key, value in action.args.items() if key != "_meta"}
+        inputs: dict[str, Any] = {
+            "sample_id": state.sample.sample_id,
+            "reason": action.reason,
+            "registry_tool": spec.name,
         }
-        return mapping[tool_name]
+        if action.tool_name == "inspect_image":
+            inputs["images"] = state.image_paths
+            return inputs
+        if action.tool_name == "match_domain_skill":
+            inputs.update(sanitized_args)
+            return inputs
+        if action.tool_name == "web_search":
+            inputs.update(
+                {
+                    "query": sanitized_args.get("query") or (state.queries[-1] if state.queries else ""),
+                    "limit": sanitized_args.get("limit"),
+                }
+            )
+            return inputs
+        if action.tool_name == "web_read":
+            inputs.update(
+                {
+                    "url": sanitized_args.get("url") or "",
+                    "title": sanitized_args.get("title") or "",
+                    "snippet": sanitized_args.get("snippet") or "",
+                }
+            )
+            return inputs
+        inputs.update(sanitized_args)
+        return inputs
 
     def _planner_state_payload(self, state: AgentState, start: float, max_total_seconds: float) -> dict[str, Any]:
         return {
@@ -722,7 +823,7 @@ class OpenHandsEvidenceRuntime:
             "sample_id": state.sample.sample_id,
             "has_images": bool(state.image_paths),
             "image_count": len(state.image_paths),
-            "allowed_tools": sorted(ALLOWED_TOOLS),
+            "allowed_tools": self.tool_registry.enabled_names(self.agent_cfg, self.web_cfg),
             "tool_counts": state.tool_counts,
             "evidence": [
                 {
@@ -791,6 +892,7 @@ class OpenHandsEvidenceRuntime:
                         "vision": self.config.vision_model,
                         "answer": self.config.agent_model,
                     },
+                    "registry_tools": self.tool_registry.names(),
                     "tool_contract": "OpenHands SDK ToolDefinition compatibility layer",
                 },
             )
