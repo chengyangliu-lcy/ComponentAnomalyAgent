@@ -136,6 +136,8 @@ def build_judge_user_prompt(question: str, reference: str, prediction: str, scor
 7. 如果预测答案编造关键型号、参数、波形、测量事实、事实来源或关键原理，factual_consistency <= 0.4，并显著降低 accuracy 和 score。
 8. 如果预测答案只给泛泛排查建议且未命中核心原因，completeness <= 2。
 9. 如果答案包含有用步骤但缺少核心结论，可给 usefulness 部分分，但 accuracy 和 completeness 不能高。
+10. 请逐项参考结构化采分点判断 hit/partial/missed/contradicted；不要因为预测答案更长、格式更像报告或声称使用了工具而加分。
+11. fully_correct 只有在核心结论正确、required 采分点基本覆盖、无关键事实错误、无编造关键型号/参数/测量事实时才为 true。
 
 必须输出 JSON 字段：
 {{
@@ -145,7 +147,11 @@ def build_judge_user_prompt(question: str, reference: str, prediction: str, scor
   "clarity": 1,
   "usefulness": 1,
   "average_score": 1.0,
-  "factual_consistency": 0.0
+  "factual_consistency": 0.0,
+  "fully_correct": false,
+  "critical_errors": [],
+  "unsupported_claims": [],
+  "scoring_point_matches": []
 }}
 
 问题：

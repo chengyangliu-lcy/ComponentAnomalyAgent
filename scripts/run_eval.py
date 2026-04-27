@@ -109,12 +109,12 @@ def main() -> None:
         progress.close()
 
     eval_cfg = config.raw.get("evaluation", {})
+    _remove_stale_summary(config.outputs_dir / args.experiment / "agent_score.json")
     write_json(
-        config.outputs_dir / args.experiment / "agent_score.json",
+        config.outputs_dir / args.experiment / "evaluation_summary.json",
         summarize_scores(
             rows,
             final_weights=eval_cfg.get("final_weights"),
-            legacy_final_weights=eval_cfg.get("legacy_final_weights"),
         ),
     )
     write_json(config.outputs_dir / args.experiment / "error_analysis.json", build_error_analysis(rows))
@@ -123,6 +123,11 @@ def main() -> None:
         f"[eval] finished evaluated={len(rows)} skipped={skipped} "
         f"max_workers={max_workers} elapsed={elapsed:.2f}s wrote={output_path}"
     )
+
+
+def _remove_stale_summary(path: Path) -> None:
+    if path.exists():
+        path.unlink()
 
 
 def _evaluate_with_worker_evaluator(
@@ -153,12 +158,34 @@ def _failed_eval_result(sample_id: str, exc: Exception, elapsed: float) -> dict[
     return {
         "sample_id": sample_id,
         "semantic_similarity": {"score": 0.0, "backend": "", "error": str(exc)},
-        "rouge_l": 0.0,
-        "bigram_jaccard": 0.0,
         "llm_judge": {"enabled": False, "score": 0.0},
-        "scoring_points": {"coverage": 0.0, "matched_points": [], "missed_points": []},
+        "scoring_points": {"coverage": None, "matched_points": [], "missed_points": [], "critical_errors": []},
         "final_score": 0.0,
-        "legacy_final_score": 0.0,
+        "claim_rouge_l": {"score": 0.0, "claims": [], "claim_scores": []},
+        "technical_entity_match": {
+            "score": 0.0,
+            "reference_entities": [],
+            "prediction_entities": [],
+            "support_entities": [],
+            "matched_entities": [],
+            "missed_entities": [],
+            "unsupported_entities": [],
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "f_beta": 0.0,
+            "unsupported_entity_weight": 0.0,
+            "unsupported_entity_rate": 0.0,
+            "entity_counts": {
+                "reference": {"structured": 0, "domain_abbrev": 0, "keyphrase": 0, "total": 0},
+                "prediction": {"structured": 0, "domain_abbrev": 0, "keyphrase": 0, "total": 0},
+                "support": {"structured": 0, "domain_abbrev": 0, "keyphrase": 0, "total": 0},
+                "unsupported": {"structured": 0, "domain_abbrev": 0, "keyphrase": 0, "total": 0},
+            },
+            "matched_by_type": {"structured": [], "domain_abbrev": [], "keyphrase": []},
+            "missed_by_type": {"structured": [], "domain_abbrev": [], "keyphrase": []},
+        },
+        "fully_correct": False,
         "error_analysis": {"reasons": [str(exc)], "severity": "high"},
         "elapsed_seconds": round(elapsed, 4),
         "errors": [str(exc)],
@@ -180,7 +207,6 @@ def _update_progress(progress: tqdm, row: dict[str, Any]) -> None:
     )
     tqdm.write(
         f"[eval] done sample_id={sample_id} final_score={float(row['final_score']):.4f} "
-        f"legacy={float(row.get('legacy_final_score', 0.0)):.4f} "
         f"llm={float(row.get('llm_judge', {}).get('score', 0.0)):.4f} "
         f"elapsed={elapsed:.2f}s errors={len(errors)}"
     )

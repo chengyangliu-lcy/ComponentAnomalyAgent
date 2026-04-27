@@ -357,7 +357,14 @@ def main() -> None:
     print(f"共加载 {requested_count} 个样本")
 
     if not args.resume:
-        for path in [output_predictions, output_eval, legacy_eval, output_summary, output_eval.with_name("baseline_score.json")]:
+        for path in [
+            output_predictions,
+            output_eval,
+            legacy_eval,
+            output_summary,
+            output_eval.with_name("evaluation_summary.json"),
+            output_eval.with_name("baseline_score.json"),
+        ]:
             if path.exists():
                 path.unlink()
     completed_post_ids = load_completed_post_ids(output_predictions) if args.resume else set()
@@ -419,15 +426,13 @@ def main() -> None:
         summary = summarize_scores(
             eval_rows,
             final_weights=eval_cfg.get("final_weights"),
-            legacy_final_weights=eval_cfg.get("legacy_final_weights"),
         )
         summary["error_analysis"] = build_error_analysis(eval_rows)
         write_json(
-            output_eval.with_name("baseline_score.json"),
+            output_eval.with_name("evaluation_summary.json"),
             summarize_scores(
                 eval_rows,
                 final_weights=eval_cfg.get("final_weights"),
-                legacy_final_weights=eval_cfg.get("legacy_final_weights"),
             ),
         )
     hard_failed = [row for row in predictions if is_hard_failed_prediction(row)]
@@ -495,12 +500,12 @@ def _eval_payload(row: Dict[str, Any]) -> Dict[str, Any] | None:
     return {
         "sample_id": str(row.get("sample_id") or row.get("post_id") or ""),
         "semantic_similarity": row.get("semantic_similarity", {}),
-        "rouge_l": row.get("rouge_l", 0.0),
-        "bigram_jaccard": row.get("bigram_jaccard", 0.0),
         "llm_judge": row.get("llm_judge", {}),
         "scoring_points": row.get("scoring_points", {}),
         "final_score": row.get("final_score", 0.0),
-        "legacy_final_score": row.get("legacy_final_score", 0.0),
+        "claim_rouge_l": row.get("claim_rouge_l", {}),
+        "technical_entity_match": row.get("technical_entity_match", {}),
+        "fully_correct": row.get("fully_correct", False),
         "error_analysis": row.get("error_analysis", {}),
         "elapsed_seconds": row.get("elapsed_seconds", 0.0),
     }

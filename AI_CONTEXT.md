@@ -176,8 +176,8 @@ LegacyFinalScore = 0.60 * SemanticSimilarity
 评测输出字段：
 
 - `semantic_similarity`
-- `rouge_l`
-- `bigram_jaccard`
+- `claim_rouge_l`
+- `technical_entity_match`
 - `llm_judge`
 - `scoring_points`
 - `final_score`
@@ -470,5 +470,4 @@ configs/default.yaml
 - `8dd21d9 feat: unify evaluation scoring`
 - `8840b21 feat: improve web evidence retrieval`
 - `fca4066 Initial ComponentAnomalyAgent implementation`
-
 

@@ -86,19 +86,16 @@ web:
 
 evaluation:
   semantic_backend: auto
+  device: cuda
   bertscore_model: models/bert-base-chinese
   bertscore_num_layers: 12
   sentence_transformer_model: models/sentence-transformers__paraphrase-multilingual-MiniLM-L12-v2
   final_weights:
-    llm_judge: 0.50
-    semantic_similarity: 0.25
-    scoring_point_coverage: 0.10
-    rouge_l: 0.10
-    bigram_jaccard: 0.05
-  legacy_final_weights:
-    semantic_similarity: 0.60
-    rouge_l: 0.25
-    bigram_jaccard: 0.15
+    llm_judge: 0.45
+    structured_point_coverage: 0.25
+    semantic_similarity: 0.20
+    claim_rouge_l: 0.05
+    technical_entity_match: 0.05
   enable_llm_judge: true
   enable_llm_scoring_points: false
 

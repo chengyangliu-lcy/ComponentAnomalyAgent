@@ -16,6 +16,10 @@ DEFAULT_DISABLED_JUDGE = {
     "usefulness": 0,
     "average_score": 0.0,
     "factual_consistency": 0.0,
+    "fully_correct": False,
+    "critical_errors": [],
+    "unsupported_claims": [],
+    "scoring_point_matches": [],
 }
 
 
@@ -62,6 +66,10 @@ def normalize_unified_judge(result: Dict[str, Any], enabled: bool = True) -> Dic
 
     payload["factual_consistency"] = _clamp_float(payload.get("factual_consistency"), 0.0, 1.0)
     payload["score"] = compute_llm_score(payload)
+    payload["fully_correct"] = bool(payload.get("fully_correct")) if enabled else False
+    for key in ["critical_errors", "unsupported_claims", "scoring_point_matches"]:
+        value = payload.get(key)
+        payload[key] = value if isinstance(value, list) else []
     return {key: payload[key] for key in DEFAULT_DISABLED_JUDGE}
 
 

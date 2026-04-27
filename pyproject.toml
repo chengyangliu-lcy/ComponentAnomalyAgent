@@ -10,6 +10,7 @@ dependencies = [
     "openai>=1.0.0",
     "openhands-sdk>=1.17.0",
     "openhands-tools>=1.17.0",
+    "jieba>=0.42.1",
     "playwright>=1.40.0",
     "pyyaml>=6.0",
     "requests>=2.31.0",

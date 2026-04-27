@@ -235,8 +235,8 @@ uv run python scripts/run_experiment.py --experiment agent_20_compare --limit 20
 评测输出 `eval_results.jsonl` 包含：
 
 - `semantic_similarity`
-- `rouge_l`
-- `bigram_jaccard`
+- `claim_rouge_l`
+- `technical_entity_match`
 - `llm_judge`
 - `scoring_points`
 - `final_score`

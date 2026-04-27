@@ -6,4 +6,4 @@ tqdm>=4.66.0
 sentence-transformers>=2.7.0
 bert-score>=0.3.13
 playwright>=1.40.0
-
+jieba>=0.42.1
