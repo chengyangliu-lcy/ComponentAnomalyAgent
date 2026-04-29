@@ -80,6 +80,16 @@ def _web_search_enabled(agent_cfg: dict[str, Any], web_cfg: dict[str, Any]) -> b
     return bool(agent_cfg.get("enable_web_search", True))
 
 
+def _local_retrieval_enabled(agent_cfg: dict[str, Any], web_cfg: dict[str, Any]) -> bool:
+    _ = web_cfg
+    return bool(agent_cfg.get("enable_local_retrieval", False))
+
+
+def _domain_skills_enabled(agent_cfg: dict[str, Any], web_cfg: dict[str, Any]) -> bool:
+    _ = web_cfg
+    return bool(agent_cfg.get("enable_domain_skills", True))
+
+
 def _image_enabled(agent_cfg: dict[str, Any], web_cfg: dict[str, Any]) -> bool:
     _ = web_cfg
     return bool(agent_cfg.get("use_images", True))
@@ -114,6 +124,22 @@ def build_default_registry() -> ToolRegistry:
                 defaults={},
                 budget_keys=("max_domain_skill_calls",),
                 recoverable_by_default=True,
+                enabled_predicate=_domain_skills_enabled,
+            ),
+            ToolSpec(
+                name="local_retrieve",
+                planner_name="local_retrieve",
+                event_tool_name="local_retrieve",
+                event_action_name="hybrid_kb_search",
+                description="Search the local Hackster/Common Crawl knowledge base for project, circuit, component, code, and public reference evidence before falling back to live web search.",
+                args_schema={
+                    "query": ToolArgSpec("string"),
+                    "limit": ToolArgSpec("integer"),
+                },
+                defaults={},
+                budget_keys=("max_local_chunks",),
+                recoverable_by_default=True,
+                enabled_predicate=_local_retrieval_enabled,
             ),
             ToolSpec(
                 name="web_search",

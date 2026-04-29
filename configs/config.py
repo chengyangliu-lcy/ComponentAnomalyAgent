@@ -44,6 +44,18 @@ class RuntimeConfig:
         return _resolve_path(self.raw["paths"]["local_corpus_root"])
 
     @property
+    def knowledge_csv(self) -> Path:
+        return _resolve_path(self.raw["paths"]["knowledge_csv"])
+
+    @property
+    def warc_root(self) -> Path:
+        return _resolve_path(self.raw["paths"]["warc_root"])
+
+    @property
+    def local_kb_index(self) -> Path:
+        return _resolve_path(self.raw["paths"]["local_kb_index"])
+
+    @property
     def outputs_dir(self) -> Path:
         return _resolve_path(self.raw["paths"]["outputs_dir"])
 

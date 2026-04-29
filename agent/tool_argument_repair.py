@@ -80,6 +80,8 @@ def repair_action_args(
 
     if tool_name == "web_search":
         repaired, notes = _repair_web_search(repaired, notes, question, max_web_results, next_seed_query)
+    elif tool_name == "local_retrieve":
+        repaired, notes = _repair_local_retrieve(repaired, notes, question, rank_limit, next_seed_query)
     elif tool_name == "web_read":
         repaired, notes = _repair_web_read(repaired, notes, select_read_target)
     elif tool_name == "rank_evidence":
@@ -103,6 +105,32 @@ def _normalize_simple_args(tool_name: str, args: dict[str, Any], notes: RepairNo
     if normalized != args:
         notes.add(f"{tool_name} args normalized")
     return normalized, notes
+
+
+def _repair_local_retrieve(
+    args: dict[str, Any],
+    notes: RepairNotes,
+    question: str,
+    max_results: int,
+    next_seed_query: Callable[[], str],
+) -> tuple[dict[str, Any], RepairNotes]:
+    query = str(args.get("query") or "").strip()
+    if not query:
+        query = next_seed_query().strip() or _build_question_query(question)
+        if query:
+            notes.add("local_retrieve query filled from question terms")
+    args["query"] = query
+    limit = args.get("limit")
+    if not isinstance(limit, int):
+        args["limit"] = max_results
+        notes.add("local_retrieve limit filled from config")
+    elif limit < 1:
+        args["limit"] = max_results
+        notes.add("local_retrieve limit reset to config default")
+    elif limit > max_results:
+        args["limit"] = max_results
+        notes.add("local_retrieve limit clipped to maximum")
+    return args, notes
 
 
 def _repair_web_search(

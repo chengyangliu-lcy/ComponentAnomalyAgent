@@ -7,3 +7,7 @@ model:
   default_agent_model: "qwen3.6-plus"
   default_judge_model: "qwen-plus"
 
+paths:
+  knowledge_csv: "D:/xinyang/216bdbde-971e-40ad-a9cf-fd0209be4282.csv"
+  warc_root: "D:/path/to/local/common-crawl-warcs"
+  local_kb_index: "knowledge_base/hackster_cc"

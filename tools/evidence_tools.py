@@ -27,6 +27,7 @@ from tools.utils import compact_text, timer
 from tools.web_reader import WebReader
 from tools.web_search import WebSearch
 from tools.openhands_browser import OpenHandsBrowserConfig, OpenHandsBrowserFetcher
+from tools.hackster_kb import HacksterHybridRetriever
 
 try:
     os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
@@ -71,6 +72,11 @@ class WebReadAction(Action):
 
 class DomainSkillAction(Action):
     question: str
+
+
+class LocalRetrieveAction(Action):
+    query: str
+    limit: int = 4
 
 
 class EvidenceRankAction(Action):
@@ -577,6 +583,39 @@ class DomainSkillExecutor(BaseEvidenceExecutor):
         return [skill for skill in skills if isinstance(skill, dict)]
 
 
+class LocalRetrieveExecutor(BaseEvidenceExecutor):
+    tool_name = "local_retrieve"
+    action_name = "hybrid_kb_search"
+
+    def __init__(self, retriever: HacksterHybridRetriever, enabled: bool = True) -> None:
+        self.retriever = retriever
+        self.enabled = enabled
+
+    def __call__(self, action: LocalRetrieveAction, conversation: Any = None) -> EvidenceObservation:
+        run = self.run(action.query, action.limit)
+        return EvidenceObservation(
+            summary=run.summary,
+            evidence=[item.to_json() for item in run.evidence],
+            errors=run.errors,
+            is_error=not run.success,
+        )
+
+    def run(self, query: str, limit: int = 4) -> ToolRun:
+        query = (query or "").strip()
+        if not self.enabled:
+            return ToolRun(summary="local retrieval disabled by config", success=False, errors=["local retrieval disabled"])
+        if not query:
+            return ToolRun(summary="local retrieval skipped: no query", success=False, errors=["no local retrieval query"])
+        evidence = self.retriever.search(query, limit=limit)
+        return ToolRun(
+            evidence=evidence,
+            summary=f"local retrieval returned {len(evidence)} chunks",
+            success=True,
+            errors=[],
+            metadata={"query": query, "limit": limit, "index_dir": str(self.retriever.index_dir)},
+        )
+
+
 class EvidenceRankExecutor(BaseEvidenceExecutor):
     tool_name = "evidence_rank"
     action_name = "rank_and_dedupe"
@@ -605,6 +644,8 @@ class EvidenceRankExecutor(BaseEvidenceExecutor):
             score += sum(1.0 for term in terms if term.lower() in text)
             if item.metadata.get("kind") == "domain_skill":
                 score += 4.0
+            if item.metadata.get("kind") == "local_kb_chunk":
+                score += 2.5
             if item.metadata.get("kind") == "image_inspection":
                 score += 3.0
             if _trusted_source(item.source):
@@ -680,9 +721,10 @@ class FinishAnswerExecutor(BaseEvidenceExecutor):
         priority = {
             "image_inspection": 0,
             "domain_skill": 1,
-            "web_page": 2,
-            "web_search_result": 3,
-            "image_context": 4,
+            "local_kb_chunk": 2,
+            "web_page": 3,
+            "web_search_result": 4,
+            "image_context": 5,
         }
         for item in sorted(evidence, key=lambda item: (priority.get(str(item.metadata.get("kind") or ""), 9), -float(item.score or 0.0))):
             if len(grouped) >= self.max_evidence:
@@ -696,6 +738,8 @@ class FinishAnswerExecutor(BaseEvidenceExecutor):
                 limit = 2200
             elif kind == "domain_skill":
                 limit = 650
+            elif kind == "local_kb_chunk":
+                limit = 700
             elif kind in {"web_page", "web_search_result"}:
                 limit = 600
             elif kind == "image_context":
@@ -711,7 +755,7 @@ class FinishAnswerExecutor(BaseEvidenceExecutor):
     def _fallback_answer(self, question: str, evidence: list[Evidence], question_hints: list[str]) -> str:
         skill_notes = [item.content for item in evidence if item.metadata.get("kind") == "domain_skill"]
         image_notes = [item.content for item in evidence if item.metadata.get("kind") == "image_inspection"]
-        web_notes = [item.content for item in evidence if item.metadata.get("kind") in {"web_search_result", "web_page"}]
+        web_notes = [item.content for item in evidence if item.metadata.get("kind") in {"web_search_result", "web_page", "local_kb_chunk"}]
         hints = ", ".join(question_hints) if question_hints else "题面关键对象未能可靠抽取"
         mechanisms = "\n".join(f"- {compact_text(note, 420)}" for note in skill_notes[:3]) or "- 现有领域证据不足，需要结合题面和实测波形判断。"
         image_summary = "\n".join(f"- {compact_text(note, 360)}" for note in image_notes[:2]) or "- 未获得可用图片细节，需以实物图或原理图复核节点。"
@@ -945,6 +989,7 @@ def _trusted_source(source: str) -> bool:
         "st.com",
         "infineon.com",
         "electronics.stackexchange.com",
+        "hackster.io",
         "edn.com",
         "ridleyengineering.com",
     )

@@ -36,6 +36,7 @@ def planner_guidance() -> str:
     return (
         "先判断当前答案还缺什么证据，再选择一个最高价值工具；每次只补一个缺口。"
         "有图片且尚未检查时优先 inspect_image；题目涉及通用电路机制时用 match_domain_skill。"
+        "如果 local_retrieve 可用，题目涉及 Hackster 项目、公开方案、器件、电路或代码参考时，先用 local_retrieve，再考虑 web_search。"
         "不要为已有证据覆盖的点重复搜索。web_search 只在缺少公开资料、型号/手册、"
         "拓扑规则或通用原理证据时使用，查询词必须包含题面中的元件、型号、数值、拓扑词和异常现象。"
         "web_read 只读一个最有价值且未读过的网址。"

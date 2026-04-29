@@ -20,11 +20,13 @@ from tools.evidence_tools import (
     FinishAnswerExecutor,
     ImageInspectAction,
     ImageInspectExecutor,
+    LocalRetrieveExecutor,
     RobustWebReadExecutor,
     ToolRun,
     build_seed_queries,
     review_evidence,
 )
+from tools.hackster_kb import DEFAULT_EMBEDDING_MODEL, HacksterHybridRetriever
 from tools.logger import TraceLogger
 from tools.utils import compact_text, timer
 
@@ -84,6 +86,7 @@ class OpenHandsEvidenceRuntime:
         self.config = config
         self.agent_cfg: dict[str, Any] = dict(config.raw.get("agent", {}))
         self.web_cfg: dict[str, Any] = dict(config.raw.get("web", {}))
+        self.retrieval_cfg: dict[str, Any] = dict(config.raw.get("retrieval", {}))
         self.tool_registry = DEFAULT_TOOL_REGISTRY
         model_cfg = config.raw.get("model", {})
         request_timeout = int(config.raw.get("runtime", {}).get("request_timeout_seconds", 20))
@@ -144,6 +147,15 @@ class OpenHandsEvidenceRuntime:
             skill_path=self._skill_path(),
             forbidden_roots=[config.image_root, config.dataset_path.parent / "2025"],
         )
+        self.local_tool = LocalRetrieveExecutor(
+            HacksterHybridRetriever(
+                index_dir=self._local_kb_index_dir(),
+                embedding_model=str(self.retrieval_cfg.get("embedding_model", DEFAULT_EMBEDDING_MODEL)),
+                dense_weight=float(self.retrieval_cfg.get("dense_weight", 0.65)),
+                keyword_weight=float(self.retrieval_cfg.get("keyword_weight", 0.35)),
+            ),
+            enabled=bool(self.agent_cfg.get("enable_local_retrieval", False)),
+        )
         self.read_tool = RobustWebReadExecutor(
             timeout=web_read_timeout,
             enable_openhands_browser_primary=bool(self.agent_cfg.get("enable_openhands_browser_primary", True)),
@@ -166,7 +178,7 @@ class OpenHandsEvidenceRuntime:
         plan = AgentPlan(
             question_type=self._classify(sample.question_text),
             needs_images=bool(image_paths) and bool(self.agent_cfg.get("use_images", True)),
-            needs_local_retrieval=False,
+            needs_local_retrieval=bool(self.agent_cfg.get("enable_local_retrieval", False)),
             needs_web_search=bool(self.agent_cfg.get("enable_web_search", True)),
             queries=[],
             steps=[],
@@ -463,6 +475,13 @@ class OpenHandsEvidenceRuntime:
             )
         if action.tool_name == "match_domain_skill":
             return self.domain_tool.run(self._domain_skill_question(question, action))
+        if action.tool_name == "local_retrieve":
+            query = str(action.args.get("query") or question).strip()
+            state.queries.append(query)
+            return self.local_tool.run(
+                query,
+                limit=int(action.args.get("limit") or self.agent_cfg.get("max_local_chunks", self.agent_cfg.get("max_local_docs", 4))),
+            )
         if action.tool_name == "web_search":
             if not bool(self.agent_cfg.get("enable_web_search", True)):
                 return ToolRun(summary="web search disabled by config", success=False, errors=["web search disabled"])
@@ -520,6 +539,10 @@ class OpenHandsEvidenceRuntime:
             max_attempts = int(self.agent_cfg.get("max_domain_skill_calls", DEFAULT_MAX_DOMAIN_SKILL_CALLS))
             if state.tool_counts.get("match_domain_skill", 0) >= max_attempts:
                 return "match_domain_skill already collected domain evidence; choose rank_evidence or finish_answer"
+        if action.tool_name == "local_retrieve":
+            max_attempts = int(self.agent_cfg.get("max_local_retrieval_calls", 1))
+            if state.tool_counts.get("local_retrieve", 0) >= max_attempts:
+                return "local_retrieve query budget exhausted"
         if action.tool_name == "web_search":
             max_queries = int(self.agent_cfg.get("max_web_queries", 3))
             if state.tool_counts.get("web_search", 0) >= max_queries:
@@ -554,8 +577,14 @@ class OpenHandsEvidenceRuntime:
     def _fallback_action(self, state: AgentState) -> AgentAction:
         if state.image_paths and state.tool_counts.get("inspect_image", 0) == 0 and bool(self.agent_cfg.get("use_images", True)):
             return AgentAction("inspect_image", reason="fallback: inspect available input images")
-        if state.tool_counts.get("match_domain_skill", 0) == 0:
+        if bool(self.agent_cfg.get("enable_domain_skills", True)) and state.tool_counts.get("match_domain_skill", 0) == 0:
             return AgentAction("match_domain_skill", reason="fallback: collect domain skill evidence")
+        if bool(self.agent_cfg.get("enable_local_retrieval", False)) and state.tool_counts.get("local_retrieve", 0) == 0:
+            return AgentAction(
+                "local_retrieve",
+                args={"query": self._next_seed_query(state) or state.sample.question_text},
+                reason="fallback: search local Hackster knowledge base",
+            )
         max_queries = int(self.agent_cfg.get("max_web_queries", 3))
         if (
             bool(self.agent_cfg.get("enable_web_search", True))
@@ -583,8 +612,9 @@ class OpenHandsEvidenceRuntime:
             return None
         has_domain = any(item.metadata.get("kind") == "domain_skill" for item in state.evidence)
         has_web = any(item.metadata.get("kind") in {"web_search_result", "web_page"} for item in state.evidence)
+        has_local = any(item.metadata.get("kind") == "local_kb_chunk" for item in state.evidence)
         has_image = any(item.metadata.get("kind") in {"image_context", "image_inspection"} for item in state.evidence)
-        enough_for_answer = (has_image and has_domain) or has_web or len(state.evidence) >= 4
+        enough_for_answer = (has_image and (has_domain or has_local)) or has_web or has_local or len(state.evidence) >= 4
         if not enough_for_answer:
             return None
         if state.tool_counts.get("rank_evidence", 0) == 0:
@@ -909,6 +939,13 @@ class OpenHandsEvidenceRuntime:
 
     def _skill_path(self) -> Path:
         raw_path = self.agent_cfg.get("domain_skills_path") or self.config.local_corpus_root / "domain_skills.yaml"
+        path = Path(raw_path)
+        if path.is_absolute():
+            return path
+        return Path(__file__).resolve().parents[1] / path
+
+    def _local_kb_index_dir(self) -> Path:
+        raw_path = self.config.raw.get("paths", {}).get("local_kb_index") or self.config.local_corpus_root / "hackster_cc"
         path = Path(raw_path)
         if path.is_absolute():
             return path

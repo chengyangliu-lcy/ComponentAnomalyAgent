@@ -2,6 +2,9 @@ paths:
   dataset: 2025_dataset.jsonl
   image_root: 2025
   local_corpus_root: knowledge_base
+  knowledge_csv: D:/xinyang/216bdbde-971e-40ad-a9cf-fd0209be4282.csv
+  warc_root: D:/xinyang/warc
+  local_kb_index: knowledge_base/hackster_cc
   outputs_dir: outputs
   logs_dir: logs
 
@@ -46,12 +49,15 @@ agent:
   enable_subagents: true
   fallback_to_legacy_on_runtime_error: true
   max_local_docs: 4
+  max_local_chunks: 4
+  max_local_retrieval_calls: 1
   max_web_queries: 3
   max_web_results: 8
   max_web_pages_to_read: 1
   search_provider: duckduckgo
   search_cache_ttl_seconds: 900
-  enable_local_retrieval: false
+  enable_domain_skills: false
+  enable_local_retrieval: true
   allow_test_corpus_retrieval: false
   enable_web_search: true
   web_search_mode: auto
@@ -83,6 +89,11 @@ web:
     bing: BING_SEARCH_API_KEY
     serpapi: SERPAPI_API_KEY
   api_keys: {}
+
+retrieval:
+  embedding_model: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+  dense_weight: 0.65
+  keyword_weight: 0.35
 
 evaluation:
   semantic_backend: auto
