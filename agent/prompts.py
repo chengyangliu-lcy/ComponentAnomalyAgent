@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
-from agent.tool_registry import DEFAULT_TOOL_REGISTRY
+from agent.tool_registry import DEFAULT_TOOL_REGISTRY, ToolSpec
 
 
-def _build_planner_system_prompt() -> str:
-    tool_names = DEFAULT_TOOL_REGISTRY.planner_tool_names_text()
+def build_planner_system_prompt(enabled_specs: list[ToolSpec] | None = None) -> str:
+    specs = enabled_specs or list(DEFAULT_TOOL_REGISTRY.specs())
+    tool_names = "|".join(spec.planner_name for spec in specs)
+    tool_descriptions = "\n".join(f"- {spec.planner_name}：{spec.description}" for spec in specs)
     return f"""你是只读的电子异常分析证据规划器。
 
 你正在执行“观察-行动-再观察”的工具循环。每一轮都要先查看当前状态，判断最有价值的单个证据缺口，然后只选择一个下一步工具调用。你不能修改文件或外部系统。
@@ -15,13 +17,7 @@ def _build_planner_system_prompt() -> str:
 {{"tool_name":"{tool_names}","args":{{}},"reason":"简短审计原因","stop":false}}
 
 工具策略：
-- inspect_image：存在图片且尚未收集图片证据时优先使用；图片检查失败或次数耗尽后不要重复调用。
-- match_domain_skill：用于通用电子机制、排查先验、反馈环路、补偿、滤波、电源、接地、驱动、采样和器件选型问题。
-- web_search：仅在缺少公开资料、型号资料、数据手册、拓扑规则、失效机制或高价值通用参考时使用。查询词必须包含题面中的具体术语，例如元件位号、型号、数值、拓扑词和异常现象；不要只搜索“原因 处理”这类泛词。
-- web_read：当搜索结果摘要有价值时，读取一个最有价值且未读过的公开网址；不要重复读取已读或失败的网址。
-- rank_evidence：收集到多来源证据后使用，或在证据较杂但准备结束前使用。
-- review_evidence：需要检查图片、元件、原因或处理建议等证据覆盖度时使用。
-- finish_answer：仅在证据足够、剩余预算较低，或重复可恢复错误让继续调用工具价值很低时使用。证据不完整时，最终答案必须明确不确定性。
+{tool_descriptions}
 
 失败策略：
 - 不要重复调用失败工具，除非当前状态显示有新的参数能直接解决失败原因。
@@ -29,17 +25,36 @@ def _build_planner_system_prompt() -> str:
 - reason 字段只简要说明正在补哪个证据缺口，不写私有推理过程。"""
 
 
-PLANNER_SYSTEM_PROMPT = _build_planner_system_prompt()
+PLANNER_SYSTEM_PROMPT = build_planner_system_prompt()
 
 
-def planner_guidance() -> str:
+def planner_guidance(enabled_tool_names: list[str] | None = None) -> str:
+    enabled = set(enabled_tool_names or DEFAULT_TOOL_REGISTRY.planner_tool_names())
+    local_note = (
+        "local_retrieve 只收集诊断信息，KB 证据不会进入最终答案；"
+        "仅在题目有明确型号+公式/拓扑/故障缺口时使用，其他情况不要调用。"
+        "由于本地库主要是英文，调用时要改写成英文电子关键词，并保留型号、位号和数值。"
+        if "local_retrieve" in enabled
+        else "本轮 local_retrieve 不可用，不要选择本地知识库工具。"
+    )
+    domain_note = (
+        "题目涉及通用电路机制时用 match_domain_skill。"
+        if "match_domain_skill" in enabled
+        else "本轮 match_domain_skill 不可用，不要选择领域技能工具。"
+    )
+    web_note = (
+        "web_search 只在缺少公开资料、型号/手册、拓扑规则或通用原理证据时使用，查询词必须包含题面中的元件、型号、数值、拓扑词和异常现象。"
+        "web_read 只读一个最有价值且未读过的网址。"
+        if "web_search" in enabled
+        else "本轮 web_search/web_read 不可用，不要选择联网工具。"
+    )
     return (
         "先判断当前答案还缺什么证据，再选择一个最高价值工具；每次只补一个缺口。"
-        "有图片且尚未检查时优先 inspect_image；题目涉及通用电路机制时用 match_domain_skill。"
-        "如果 local_retrieve 可用，题目涉及 Hackster 项目、公开方案、器件、电路或代码参考时，先用 local_retrieve，再考虑 web_search。"
-        "不要为已有证据覆盖的点重复搜索。web_search 只在缺少公开资料、型号/手册、"
-        "拓扑规则或通用原理证据时使用，查询词必须包含题面中的元件、型号、数值、拓扑词和异常现象。"
-        "web_read 只读一个最有价值且未读过的网址。"
+        "有图片且尚未检查时优先 inspect_image；"
+        f"{domain_note}"
+        f"{local_note}"
+        "不要为已有证据覆盖的点重复搜索。"
+        f"{web_note}"
         "如果 review_evidence 指出缺少图片、元件、原因或处理建议，下一步应补对应证据。"
         "finish_answer 只能在题面、图片、领域或网页证据已经足够，或者预算/连续错误让继续执行价值很低时使用；"
         "证据不足时必须在最终答案中保留不确定性。"

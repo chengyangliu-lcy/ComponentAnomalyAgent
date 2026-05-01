@@ -27,7 +27,13 @@ from tools.utils import compact_text, timer
 from tools.web_reader import WebReader
 from tools.web_search import WebSearch
 from tools.openhands_browser import OpenHandsBrowserConfig, OpenHandsBrowserFetcher
-from tools.hackster_kb import HacksterHybridRetriever
+from tools.circuit_kb import (
+    CircuitMarkdownRetriever,
+    classify_query_terms,
+    is_boilerplate_text,
+    is_circuitmaker_project_source,
+    is_low_value_source,
+)
 
 try:
     os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
@@ -585,9 +591,9 @@ class DomainSkillExecutor(BaseEvidenceExecutor):
 
 class LocalRetrieveExecutor(BaseEvidenceExecutor):
     tool_name = "local_retrieve"
-    action_name = "hybrid_kb_search"
+    action_name = "circuit_md_fts_search"
 
-    def __init__(self, retriever: HacksterHybridRetriever, enabled: bool = True) -> None:
+    def __init__(self, retriever: CircuitMarkdownRetriever, enabled: bool = True) -> None:
         self.retriever = retriever
         self.enabled = enabled
 
@@ -606,13 +612,41 @@ class LocalRetrieveExecutor(BaseEvidenceExecutor):
             return ToolRun(summary="local retrieval disabled by config", success=False, errors=["local retrieval disabled"])
         if not query:
             return ToolRun(summary="local retrieval skipped: no query", success=False, errors=["no local retrieval query"])
-        evidence = self.retriever.search(query, limit=limit)
+        status = self.retriever.status()
+        if not status.usable:
+            return ToolRun(
+                summary=f"local retrieval unavailable: {status.error or 'index is not usable'}",
+                success=False,
+                errors=[f"local KB index unavailable: {status.error or 'index is not usable'}"],
+                metadata=status.to_json(),
+            )
+        search_result = self.retriever.search_with_diagnostics(query, limit=limit)
+        retrieved_evidence = search_result["evidence"]
+        evidence = [item for item in retrieved_evidence if item.metadata.get("high_relevance") is True]
+        diagnostics = search_result.get("diagnostics") or {}
+        success = bool(evidence)
         return ToolRun(
             evidence=evidence,
             summary=f"local retrieval returned {len(evidence)} chunks",
-            success=True,
-            errors=[],
-            metadata={"query": query, "limit": limit, "index_dir": str(self.retriever.index_dir)},
+            success=success,
+            errors=[] if success else ["no high-relevance local KB evidence"],
+            metadata={
+                "query": query,
+                "limit": limit,
+                "index_dir": str(self.retriever.index_dir),
+                "index_status": status.to_json(),
+                "nonempty": bool(evidence),
+                "chunks": len(evidence),
+                "kb_candidate_count": int(diagnostics.get("candidate_count") or 0),
+                "kb_used_count": len(evidence),
+                "kb_discarded_count": int(diagnostics.get("discarded_kb") or 0) + max(0, len(retrieved_evidence) - len(evidence)),
+                "noise_filtered_count": int(diagnostics.get("discarded_noise") or 0),
+                "low_value_source_filtered_count": int(diagnostics.get("discarded_low_value_source") or 0),
+                "low_value_project_filtered_count": int(diagnostics.get("discarded_low_value_project") or 0),
+                "required_terms_filtered_count": int(diagnostics.get("discarded_required_terms") or 0),
+                "high_relevance_count": int(diagnostics.get("high_relevance_count") or 0),
+                "high_relevance_rate": float(diagnostics.get("high_relevance_rate") or 0.0),
+            },
         )
 
 
@@ -634,18 +668,21 @@ class EvidenceRankExecutor(BaseEvidenceExecutor):
         terms = _query_terms(question)
         seen: set[str] = set()
         ranked: list[tuple[float, Evidence]] = []
+        discarded_kb = 0
         for item in evidence:
             key = (item.source or item.title or item.content[:80]).strip().lower()
             if not key or key in seen:
                 continue
             seen.add(key)
+            if item.metadata.get("kind") == "local_kb_chunk":
+                item.metadata["discarded_kb"] = True
+                discarded_kb += 1
+                continue
             text = f"{item.title} {item.content} {item.source}".lower()
             score = float(item.score or 0.0)
             score += sum(1.0 for term in terms if term.lower() in text)
             if item.metadata.get("kind") == "domain_skill":
                 score += 4.0
-            if item.metadata.get("kind") == "local_kb_chunk":
-                score += 2.5
             if item.metadata.get("kind") == "image_inspection":
                 score += 3.0
             if _trusted_source(item.source):
@@ -654,7 +691,11 @@ class EvidenceRankExecutor(BaseEvidenceExecutor):
             ranked.append((score, item))
         ranked.sort(key=lambda pair: pair[0], reverse=True)
         kept = [item for _, item in ranked[:max_items]]
-        return ToolRun(kept, summary=f"ranked {len(kept)}/{len(evidence)} evidence items")
+        return ToolRun(
+            kept,
+            summary=f"ranked {len(kept)}/{len(evidence)} evidence items",
+            metadata={"discarded_kb": discarded_kb},
+        )
 
 
 class FinishAnswerExecutor(BaseEvidenceExecutor):
@@ -672,7 +713,7 @@ class FinishAnswerExecutor(BaseEvidenceExecutor):
 
     def run(self, question: str, evidence: list[Evidence], allow_llm: bool = True) -> ToolRun:
         question_hints = _query_terms(question)[:12]
-        compact_evidence = self._dedupe_evidence(evidence)
+        compact_evidence = self._dedupe_evidence(evidence, question=question)
         evidence_text = self._format_evidence_for_answer(compact_evidence)
         if allow_llm and self.llm.available:
             response = self.llm.chat(
@@ -699,10 +740,13 @@ class FinishAnswerExecutor(BaseEvidenceExecutor):
         answer = self._fallback_answer(question, compact_evidence, question_hints)
         return ToolRun(text=answer, summary="final answer generated from ranked evidence", success=bool(answer), errors=errors)
 
-    def _dedupe_evidence(self, evidence: list[Evidence]) -> list[Evidence]:
+    def _dedupe_evidence(self, evidence: list[Evidence], question: str = "") -> list[Evidence]:
         seen: set[str] = set()
         kept: list[Evidence] = []
         for item in evidence:
+            if item.metadata.get("kind") == "local_kb_chunk":
+                item.metadata["discarded_kb"] = True
+                continue
             key = "\n".join(
                 [
                     str(item.source or "").strip().lower(),
@@ -721,7 +765,6 @@ class FinishAnswerExecutor(BaseEvidenceExecutor):
         priority = {
             "image_inspection": 0,
             "domain_skill": 1,
-            "local_kb_chunk": 2,
             "web_page": 3,
             "web_search_result": 4,
             "image_context": 5,
@@ -738,8 +781,6 @@ class FinishAnswerExecutor(BaseEvidenceExecutor):
                 limit = 2200
             elif kind == "domain_skill":
                 limit = 650
-            elif kind == "local_kb_chunk":
-                limit = 700
             elif kind in {"web_page", "web_search_result"}:
                 limit = 600
             elif kind == "image_context":
@@ -755,7 +796,7 @@ class FinishAnswerExecutor(BaseEvidenceExecutor):
     def _fallback_answer(self, question: str, evidence: list[Evidence], question_hints: list[str]) -> str:
         skill_notes = [item.content for item in evidence if item.metadata.get("kind") == "domain_skill"]
         image_notes = [item.content for item in evidence if item.metadata.get("kind") == "image_inspection"]
-        web_notes = [item.content for item in evidence if item.metadata.get("kind") in {"web_search_result", "web_page", "local_kb_chunk"}]
+        web_notes = [item.content for item in evidence if item.metadata.get("kind") in {"web_search_result", "web_page"}]
         hints = ", ".join(question_hints) if question_hints else "题面关键对象未能可靠抽取"
         mechanisms = "\n".join(f"- {compact_text(note, 420)}" for note in skill_notes[:3]) or "- 现有领域证据不足，需要结合题面和实测波形判断。"
         image_summary = "\n".join(f"- {compact_text(note, 360)}" for note in image_notes[:2]) or "- 未获得可用图片细节，需以实物图或原理图复核节点。"
@@ -980,6 +1021,34 @@ def _query_terms(text: str) -> list[str]:
     return list(dict.fromkeys(cleaned))
 
 
+def _kb_evidence_allowed(question: str, item: Evidence, min_relevance: float = 5.0) -> bool:
+    relevance = float(item.metadata.get("kb_relevance") or item.metadata.get("rerank_score") or item.score or 0.0)
+    if relevance < min_relevance:
+        return False
+    if item.metadata.get("high_relevance") is False:
+        return False
+    if is_low_value_source(item.source) or is_boilerplate_text(f"{item.title}\n{item.source}\n{item.content}"):
+        return False
+    matched_terms = item.metadata.get("matched_query_terms") if isinstance(item.metadata, dict) else {}
+    if is_circuitmaker_project_source(item.source):
+        strong_matched = []
+        if isinstance(matched_terms, dict):
+            for key in ("models", "refdes", "values"):
+                strong_matched.extend(matched_terms.get(key) or [])
+        if not strong_matched and relevance < min_relevance + 2.0:
+            return False
+    if not question:
+        return True
+    text = f"{item.title} {item.source} {item.content}".lower()
+    profile = classify_query_terms(question)
+    terms = [term.lower() for term in _query_terms(question)]
+    strong_terms = [term.lower() for term in [*profile["models"], *profile["refdes"], *profile["values"]]]
+    if strong_terms:
+        return any(term in text for term in strong_terms)
+    matched = sum(1 for term in terms if len(term) >= 3 and term in text)
+    return matched >= 2
+
+
 def _trusted_source(source: str) -> bool:
     host = urlparse(source).hostname or ""
     trusted_markers = (
@@ -989,7 +1058,6 @@ def _trusted_source(source: str) -> bool:
         "st.com",
         "infineon.com",
         "electronics.stackexchange.com",
-        "hackster.io",
         "edn.com",
         "ridleyengineering.com",
     )

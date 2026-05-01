@@ -23,6 +23,8 @@ LLM_JUDGE_SCORE_WEIGHTS = {
 def summarize_scores(
     rows: Iterable[Dict[str, Any]],
     final_weights: Dict[str, float] | None = None,
+    predictions: Iterable[Dict[str, Any]] | None = None,
+    common_sample_count: int | None = None,
 ) -> Dict[str, Any]:
     items = list(rows)
     if not items:
@@ -110,6 +112,10 @@ def summarize_scores(
     }
     if llm_judge:
         summary["llm_judge"] = llm_judge
+    summary["sample_counts"] = _sample_counts(items, common_sample_count=common_sample_count)
+    kb_diagnostics = _kb_diagnostics(list(predictions or []))
+    if kb_diagnostics:
+        summary["kb_diagnostics"] = kb_diagnostics
     return summary
 
 
@@ -120,6 +126,108 @@ def _avg(values: Iterable[float]) -> float:
 
 def _round_weights(weights: Dict[str, float]) -> Dict[str, float]:
     return {key: round(float(value), 4) for key, value in weights.items()}
+
+
+def _sample_counts(items: list[Dict[str, Any]], common_sample_count: int | None = None) -> Dict[str, Any]:
+    counts: Dict[str, int] = {}
+    missing = 0
+    for item in items:
+        sample_id = str(item.get("sample_id") or "")
+        if not sample_id:
+            missing += 1
+            continue
+        counts[sample_id] = counts.get(sample_id, 0) + 1
+    duplicate_sample_count = sum(1 for count in counts.values() if count > 1)
+    duplicate_row_count = sum(count - 1 for count in counts.values() if count > 1)
+    result: Dict[str, Any] = {
+        "rows": len(items),
+        "unique_samples": len(counts),
+        "duplicate_sample_count": duplicate_sample_count,
+        "duplicate_row_count": duplicate_row_count,
+        "missing_sample_id_rows": missing,
+    }
+    if common_sample_count is not None:
+        result["common_samples"] = int(common_sample_count)
+    return result
+
+
+def _kb_diagnostics(predictions: list[Dict[str, Any]]) -> Dict[str, Any]:
+    if not predictions:
+        return {}
+    calls = 0
+    nonempty = 0
+    chunks = 0
+    kb_candidate_count = 0
+    kb_used_count = 0
+    kb_discarded_count = 0
+    noise_filtered_count = 0
+    low_value_source_filtered_count = 0
+    low_value_project_filtered_count = 0
+    required_terms_filtered_count = 0
+    high_relevance_count = 0
+    index_path = ""
+    index_exists: bool | None = None
+    answer_used = 0
+    selected_samples = 0
+    for pred in predictions:
+        selected = [
+            action.get("tool_name")
+            for action in (pred.get("plan") or {}).get("selected_actions", []) or []
+            if isinstance(action, dict)
+        ]
+        if "local_retrieve" in selected:
+            selected_samples += 1
+        answer = str(pred.get("answer") or "")
+        if "local_kb_chunk" in answer or "本地" in answer and "知识库" in answer:
+            answer_used += 1
+        for event in pred.get("tool_trace", []) or []:
+            if not isinstance(event, dict):
+                continue
+            if event.get("tool_name") != "local_retrieve" and event.get("action") != "circuit_md_fts_search":
+                continue
+            calls += 1
+            metadata = (event.get("outputs") or {}).get("metadata") or {}
+            status = metadata.get("index_status") or {}
+            if metadata.get("index_dir"):
+                index_path = str(metadata.get("index_dir"))
+            if status.get("db_path"):
+                index_path = str(status.get("db_path"))
+            if isinstance(status.get("exists"), bool):
+                index_exists = bool(status.get("exists"))
+            event_chunks = int(metadata.get("chunks") or 0)
+            evidence_delta = int((event.get("outputs") or {}).get("evidence_delta") or 0)
+            count = max(event_chunks, evidence_delta, len((event.get("outputs") or {}).get("sources") or []))
+            chunks += count
+            kb_candidate_count += int(metadata.get("kb_candidate_count") or count)
+            kb_used_count += int(metadata.get("kb_used_count") or count)
+            kb_discarded_count += int(metadata.get("kb_discarded_count") or 0)
+            noise_filtered_count += int(metadata.get("noise_filtered_count") or 0)
+            low_value_source_filtered_count += int(metadata.get("low_value_source_filtered_count") or 0)
+            low_value_project_filtered_count += int(metadata.get("low_value_project_filtered_count") or 0)
+            required_terms_filtered_count += int(metadata.get("required_terms_filtered_count") or 0)
+            high_relevance_count += int(metadata.get("high_relevance_count") or 0)
+            if count > 0:
+                nonempty += 1
+    if calls == 0 and selected_samples == 0:
+        return {}
+    return {
+        "local_retrieve_selected_samples": selected_samples,
+        "local_retrieve_calls": calls,
+        "local_retrieve_nonempty_rate": round(nonempty / calls, 4) if calls else 0.0,
+        "avg_chunks": round(chunks / calls, 4) if calls else 0.0,
+        "index_path": index_path,
+        "index_exists": index_exists,
+        "kb_evidence_used_rate": round(answer_used / len(predictions), 4) if predictions else 0.0,
+        "kb_candidate_count": kb_candidate_count,
+        "kb_used_count": kb_used_count,
+        "kb_discarded_count": kb_discarded_count,
+        "noise_filtered_count": noise_filtered_count,
+        "low_value_source_filtered_count": low_value_source_filtered_count,
+        "low_value_project_filtered_count": low_value_project_filtered_count,
+        "required_terms_filtered_count": required_terms_filtered_count,
+        "high_relevance_count": high_relevance_count,
+        "high_relevance_rate": round(high_relevance_count / kb_used_count, 4) if kb_used_count else 0.0,
+    }
 
 
 def build_error_analysis(rows: List[Dict[str, Any]]) -> Dict[str, Any]:

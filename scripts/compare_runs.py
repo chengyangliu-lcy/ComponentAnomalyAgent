@@ -47,6 +47,7 @@ def main() -> None:
     if prediction_path.exists():
         predictions = _read_jsonl(prediction_path, duplicates="keep-last", label="agent predictions")
         report["agent_runtime"] = _agent_runtime_stats(predictions)
+        report["kb_buckets"] = _kb_bucket_report(report, predictions)
     write_json(Path(args.output), report)
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
@@ -156,6 +157,63 @@ def _agent_runtime_stats(predictions: list[dict[str, Any]]) -> dict[str, Any]:
             reverse=True,
         )[:10],
     }
+
+
+def _kb_bucket_report(report: dict[str, Any], predictions: list[dict[str, Any]]) -> dict[str, Any]:
+    deltas = {
+        str(item.get("sample_id")): float(item.get("delta") or 0.0)
+        for item in report.get("all_sample_deltas", [])
+        if item.get("sample_id")
+    }
+    prediction_by_id = {str(row.get("sample_id") or ""): row for row in predictions if row.get("sample_id")}
+    buckets: dict[str, list[float]] = {name: [] for name in ["KB未调用", "KB无高相关结果", "KB候选被丢弃", "KB进入答案"]}
+    for sample_id, delta in deltas.items():
+        row = prediction_by_id.get(sample_id)
+        if not row:
+            continue
+        bucket = _kb_bucket(row)
+        buckets[bucket].append(delta)
+    return {
+        name: {
+            "samples": len(values),
+            "average_delta": round(sum(values) / len(values), 4) if values else 0.0,
+            "improved": sum(1 for value in values if value > 0),
+            "regressed": sum(1 for value in values if value < 0),
+        }
+        for name, values in buckets.items()
+    }
+
+
+def _kb_bucket(row: dict[str, Any]) -> str:
+    lr_calls = 0
+    lr_candidates = 0
+    lr_discarded = 0
+    kb_in_answer = False
+    for event in row.get("tool_trace", []) or []:
+        if not isinstance(event, dict):
+            continue
+        tool_name = event.get("tool_name") or ""
+        if tool_name == "local_retrieve":
+            lr_calls += 1
+            metadata = (event.get("outputs") or {}).get("metadata") or {}
+            lr_candidates += int(metadata.get("kb_candidate_count") or 0)
+            lr_discarded += int(metadata.get("kb_discarded_count") or 0)
+        if tool_name in ("evidence_rank", "finish_answer"):
+            evidence = (event.get("inputs") or {}).get("evidence") or []
+            if isinstance(evidence, list):
+                for item in evidence:
+                    if isinstance(item, dict) and (item.get("metadata") or {}).get("kind") == "local_kb_chunk":
+                        if not (item.get("metadata") or {}).get("discarded_kb"):
+                            kb_in_answer = True
+    if lr_calls == 0:
+        return "KB未调用"
+    if kb_in_answer:
+        return "KB进入答案"
+    if lr_candidates > 0 and lr_discarded > 0:
+        return "KB候选被丢弃"
+    if lr_candidates == 0:
+        return "KB无高相关结果"
+    return "KB候选被丢弃"
 
 
 if __name__ == "__main__":

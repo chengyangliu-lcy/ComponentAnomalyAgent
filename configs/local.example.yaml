@@ -8,6 +8,5 @@ model:
   default_judge_model: "qwen-plus"
 
 paths:
-  knowledge_csv: "D:/xinyang/216bdbde-971e-40ad-a9cf-fd0209be4282.csv"
-  warc_root: "D:/path/to/local/common-crawl-warcs"
-  local_kb_index: "knowledge_base/hackster_cc"
+  circuit_md_root: "/media/work/1ECC291B3E106A4A/xinyang/circuit/warc_output/021150c8-bb23-4a74-9298-0e4be68a6eef"
+  local_kb_index: "knowledge_base/circuit_md_fts"

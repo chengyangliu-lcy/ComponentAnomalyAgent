@@ -115,6 +115,7 @@ def main() -> None:
         summarize_scores(
             rows,
             final_weights=eval_cfg.get("final_weights"),
+            predictions=predictions,
         ),
     )
     write_json(config.outputs_dir / args.experiment / "error_analysis.json", build_error_analysis(rows))

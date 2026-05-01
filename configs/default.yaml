@@ -2,9 +2,8 @@ paths:
   dataset: 2025_dataset.jsonl
   image_root: 2025
   local_corpus_root: knowledge_base
-  knowledge_csv: D:/xinyang/216bdbde-971e-40ad-a9cf-fd0209be4282.csv
-  warc_root: D:/xinyang/warc
-  local_kb_index: knowledge_base/hackster_cc
+  circuit_md_root: /media/work/1ECC291B3E106A4A/xinyang/circuit/warc_output/021150c8-bb23-4a74-9298-0e4be68a6eef
+  local_kb_index: knowledge_base/circuit_md_fts
   outputs_dir: outputs
   logs_dir: logs
 
@@ -32,8 +31,8 @@ agent:
   strategy: agentic_tool_loop
   legacy_strategy: legacy_single_agent_web_reasoning
   max_reflection_rounds: 1
-  max_iterations: 8
-  max_total_seconds: 180
+  max_iterations: 20
+  max_total_seconds: 300
   planner_timeout_seconds: 25
   tool_timeout_seconds: 20
   vision_timeout_seconds: 35
@@ -49,11 +48,11 @@ agent:
   enable_subagents: true
   fallback_to_legacy_on_runtime_error: true
   max_local_docs: 4
-  max_local_chunks: 4
-  max_local_retrieval_calls: 1
+  max_local_chunks: 6
+  max_local_retrieval_calls: 2
   max_web_queries: 3
   max_web_results: 8
-  max_web_pages_to_read: 1
+  max_web_pages_to_read: 3
   search_provider: duckduckgo
   search_cache_ttl_seconds: 900
   enable_domain_skills: false
@@ -91,9 +90,11 @@ web:
   api_keys: {}
 
 retrieval:
-  embedding_model: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+  embedding_model: ''
   dense_weight: 0.65
-  keyword_weight: 0.35
+  sparse_weight: 0.35
+  device: cuda
+  embedding_batch_size: 64
 
 evaluation:
   semantic_backend: auto
@@ -112,6 +113,6 @@ evaluation:
 
 runtime:
   seed: 42
-  request_timeout_seconds: 90
+  request_timeout_seconds: 180
   max_workers: 1
   resume: true

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from schemas import Evidence
+from tools.circuit_kb import expand_chinese_electronics_terms
 
 
 GENERIC_QUERY_TERMS = {
@@ -119,7 +120,12 @@ def _repair_local_retrieve(
         query = next_seed_query().strip() or _build_question_query(question)
         if query:
             notes.add("local_retrieve query filled from question terms")
-    args["query"] = query
+    rewritten = _rewrite_local_retrieve_query(query, question)
+    if rewritten != query:
+        notes.query_rewrite_before = query or None
+        notes.query_rewrite_after = rewritten
+        notes.add("local_retrieve query expanded with English circuit terms")
+    args["query"] = rewritten
     limit = args.get("limit")
     if not isinstance(limit, int):
         args["limit"] = max_results
@@ -131,6 +137,16 @@ def _repair_local_retrieve(
         args["limit"] = max_results
         notes.add("local_retrieve limit clipped to maximum")
     return args, notes
+
+
+def _rewrite_local_retrieve_query(query: str, question: str) -> str:
+    query = re.sub(r"\s+", " ", query or "").strip()
+    base_text = f"{question} {query}".strip()
+    expansions = expand_chinese_electronics_terms(base_text)
+    if not expansions:
+        return query
+    items = list(dict.fromkeys([query, *expansions]))
+    return " ".join(item for item in items if item).strip()
 
 
 def _repair_web_search(

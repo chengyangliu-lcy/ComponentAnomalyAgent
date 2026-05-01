@@ -59,7 +59,7 @@ class Evaluator:
             base_url=config.base_url,
             model=config.judge_model,
             temperature=float(model_cfg.get("temperature", 0.2)),
-            max_tokens=int(model_cfg.get("max_tokens", 2000)),
+            max_tokens=int(eval_cfg.get("judge_max_tokens", model_cfg.get("max_tokens", 4000))),
             timeout=timeout,
         )
         self.judge = LLMJudge(judge_llm, enabled=bool(eval_cfg.get("enable_llm_judge", True)))

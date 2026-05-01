@@ -59,6 +59,9 @@ class ToolRegistry:
     def names(self) -> list[str]:
         return list(self._specs)
 
+    def specs(self) -> list[ToolSpec]:
+        return list(self._specs.values())
+
     def enabled_specs(self, agent_cfg: dict[str, Any], web_cfg: dict[str, Any]) -> list[ToolSpec]:
         return [spec for spec in self._specs.values() if spec.is_enabled(agent_cfg, web_cfg)]
 
@@ -82,12 +85,14 @@ def _web_search_enabled(agent_cfg: dict[str, Any], web_cfg: dict[str, Any]) -> b
 
 def _local_retrieval_enabled(agent_cfg: dict[str, Any], web_cfg: dict[str, Any]) -> bool:
     _ = web_cfg
-    return bool(agent_cfg.get("enable_local_retrieval", False))
+    return bool(agent_cfg.get("enable_local_retrieval", False)) and bool(
+        agent_cfg.get("local_retrieval_available", True)
+    )
 
 
 def _domain_skills_enabled(agent_cfg: dict[str, Any], web_cfg: dict[str, Any]) -> bool:
     _ = web_cfg
-    return bool(agent_cfg.get("enable_domain_skills", True))
+    return bool(agent_cfg.get("enable_domain_skills", True)) and bool(agent_cfg.get("domain_skills_available", True))
 
 
 def _image_enabled(agent_cfg: dict[str, Any], web_cfg: dict[str, Any]) -> bool:
@@ -130,8 +135,8 @@ def build_default_registry() -> ToolRegistry:
                 name="local_retrieve",
                 planner_name="local_retrieve",
                 event_tool_name="local_retrieve",
-                event_action_name="hybrid_kb_search",
-                description="Search the local Hackster/Common Crawl knowledge base for project, circuit, component, code, and public reference evidence before falling back to live web search.",
+                event_action_name="circuit_md_fts_search",
+                description="Search the local Circuit Markdown knowledge base for project, circuit, component, code, and public reference evidence before falling back to live web search. The corpus is mostly English, so Chinese questions should be rewritten into concise English electronics keywords while preserving model numbers, refdes, values, and fault symptoms.",
                 args_schema={
                     "query": ToolArgSpec("string"),
                     "limit": ToolArgSpec("integer"),

@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
 
 from agent.pipeline import AgentPipeline, result_path
 from configs.config import load_config
+from tools.dense_retriever import DenseRetriever
 from tools.dataset_parser import DatasetParser
 from tools.sample_ids import filter_items_by_sample_ids, read_sample_ids_file
 from tools.utils import append_jsonl, write_json
@@ -32,17 +33,56 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default=None)
     parser.add_argument("--enable-web", action="store_true")
     parser.add_argument("--disable-web", action="store_true")
+    parser.add_argument("--enable-local-retrieval", action="store_true")
+    parser.add_argument("--disable-local-retrieval", action="store_true")
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--max-workers", type=int, default=None, help="Concurrent samples to infer. Defaults to runtime.max_workers.")
     return parser.parse_args()
 
 
+def _build_shared_dense_retriever(config: Any) -> Any:
+    """Build and load a DenseRetriever once to share across all workers.
+
+    Loads both the embedding model and index so each worker thread reuses
+    the same GPU memory instead of loading N copies (~4.6GB each).
+    """
+    retrieval_cfg = dict(config.raw.get("retrieval", {}))
+    embedding_model = retrieval_cfg.get("embedding_model", "")
+    if not embedding_model:
+        return None
+    from pathlib import Path
+    raw_path = config.raw.get("paths", {}).get("local_kb_index", "")
+    kb_dir = Path(raw_path) if raw_path else Path("knowledge_base/circuit_diagnosis_fts")
+    if kb_dir.is_absolute():
+        index_dir = kb_dir
+    else:
+        index_dir = Path(__file__).resolve().parents[1] / kb_dir
+    retriever = DenseRetriever(
+        model_name=embedding_model,
+        index_dir=index_dir,
+        device=retrieval_cfg.get("device", "cuda"),
+        batch_size=int(retrieval_cfg.get("embedding_batch_size", 64)),
+    )
+    dense_status = retriever.status()
+    if not dense_status.usable:
+        print(f"[infer] shared DenseRetriever not usable: {dense_status.error or 'index missing'}")
+        return None
+    retriever.load_index()
+    retriever.load_model()
+    print(f"[infer] shared DenseRetriever loaded: model={embedding_model} chunks={dense_status.chunk_count} dim={dense_status.embedding_dim}")
+    return retriever
+
+
 def main() -> None:
     args = parse_args()
-    overrides = None
+    overrides: dict[str, Any] = {}
     if args.enable_web or args.disable_web:
-        overrides = {"agent": {"enable_web_search": bool(args.enable_web and not args.disable_web)}}
-    config = load_config(args.config, overrides=overrides)
+        overrides.setdefault("agent", {})["enable_web_search"] = bool(args.enable_web and not args.disable_web)
+    if args.enable_local_retrieval or args.disable_local_retrieval:
+        overrides.setdefault("agent", {})["enable_local_retrieval"] = bool(
+            args.enable_local_retrieval and not args.disable_local_retrieval
+        )
+    config = load_config(args.config, overrides=overrides or None)
     config.ensure_dirs()
     parser = DatasetParser(config.dataset_path, config.image_root)
     samples = parser.load()
@@ -74,9 +114,11 @@ def main() -> None:
     pending_samples = [sample for sample in samples if sample.sample_id not in seen]
     skipped = len(samples) - len(pending_samples)
     max_workers = max(1, int(args.max_workers or config.raw.get("runtime", {}).get("max_workers", 1)))
+    shared_retriever = _build_shared_dense_retriever(config) if max_workers > 1 else None
     print(
         f"[infer] experiment={args.experiment} requested={len(samples)} "
-        f"pending={len(pending_samples)} skipped={skipped} max_workers={max_workers} output={output_path}"
+        f"pending={len(pending_samples)} skipped={skipped} max_workers={max_workers} "
+        f"shared_retriever={'yes' if shared_retriever else 'no'} output={output_path}"
     )
     completed = 0
     hard_failed = 0
@@ -104,7 +146,7 @@ def main() -> None:
         worker_state = threading.local()
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(_run_sample_with_worker_pipeline, config, worker_state, sample): sample
+                executor.submit(_run_sample_with_worker_pipeline, config, worker_state, sample, shared_retriever): sample
                 for sample in pending_samples
             }
             for future in as_completed(futures):
@@ -149,10 +191,10 @@ def main() -> None:
     )
 
 
-def _run_sample_with_worker_pipeline(config: Any, worker_state: threading.local, sample: Any) -> dict[str, Any]:
+def _run_sample_with_worker_pipeline(config: Any, worker_state: threading.local, sample: Any, shared_retriever: Any = None) -> dict[str, Any]:
     pipeline = getattr(worker_state, "pipeline", None)
     if pipeline is None:
-        pipeline = AgentPipeline(config)
+        pipeline = AgentPipeline(config, shared_dense_retriever=shared_retriever)
         worker_state.pipeline = pipeline
     started = time.perf_counter()
     try:

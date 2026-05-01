@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from agent.executor import Executor
 from agent.openhands_runtime import OpenHandsEvidenceRuntime
@@ -13,6 +13,7 @@ from configs.config import RuntimeConfig
 from llm_client import LLMClient
 from schemas import InferenceResult, StandardSample
 from tools.browser import BrowserFallback
+from tools.dense_retriever import DenseRetriever
 from tools.file_reader import FileReader
 from tools.image_resolver import ImageResolver
 from tools.logger import TraceLogger
@@ -22,12 +23,12 @@ from tools.web_search import WebSearch
 
 
 class AgentPipeline:
-    def __init__(self, config: RuntimeConfig) -> None:
+    def __init__(self, config: RuntimeConfig, shared_dense_retriever: Optional[DenseRetriever] = None) -> None:
         self.config = config
         agent_cfg: Dict[str, Any] = dict(config.raw.get("agent", {}))
         self.strategy = str(agent_cfg.get("strategy", "legacy_single_agent_web_reasoning"))
         self.openhands_runtime = (
-            OpenHandsEvidenceRuntime(config)
+            OpenHandsEvidenceRuntime(config, shared_dense_retriever=shared_dense_retriever)
             if self.strategy in {"openhands_evidence_agent", "agentic_tool_loop"}
             else None
         )

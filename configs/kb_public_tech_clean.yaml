@@ -1,0 +1,4 @@
+paths:
+  local_kb_index: knowledge_base/circuit_public_tech_clean_fts
+agent:
+  enable_local_retrieval: true

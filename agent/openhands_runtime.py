@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from agent.prompts import PLANNER_SYSTEM_PROMPT, planner_guidance
+from agent.prompts import build_planner_system_prompt, planner_guidance
 from agent.tool_argument_repair import RepairNotes, repair_action_args
 from agent.tool_registry import DEFAULT_TOOL_REGISTRY, ToolSpec
 from configs.config import RuntimeConfig
@@ -26,7 +26,8 @@ from tools.evidence_tools import (
     build_seed_queries,
     review_evidence,
 )
-from tools.hackster_kb import DEFAULT_EMBEDDING_MODEL, HacksterHybridRetriever
+from tools.circuit_kb import CircuitMarkdownRetriever, classify_query_terms
+from tools.dense_retriever import DenseRetriever
 from tools.logger import TraceLogger
 from tools.utils import compact_text, timer
 
@@ -82,12 +83,29 @@ class OpenHandsEvidenceRuntime:
     observes the result, and decides whether to continue or finish.
     """
 
-    def __init__(self, config: RuntimeConfig) -> None:
+    def __init__(self, config: RuntimeConfig, shared_dense_retriever: DenseRetriever | None = None) -> None:
         self.config = config
         self.agent_cfg: dict[str, Any] = dict(config.raw.get("agent", {}))
         self.web_cfg: dict[str, Any] = dict(config.raw.get("web", {}))
         self.retrieval_cfg: dict[str, Any] = dict(config.raw.get("retrieval", {}))
         self.tool_registry = DEFAULT_TOOL_REGISTRY
+        self.skill_path = self._skill_path()
+        self.local_kb_index_dir = self._local_kb_index_dir()
+        self._dense_retriever = shared_dense_retriever or self._build_dense_retriever()
+        self.local_retriever = CircuitMarkdownRetriever(
+            index_dir=self.local_kb_index_dir,
+            dense_weight=float(self.retrieval_cfg.get("dense_weight", 0.65)),
+            sparse_weight=float(self.retrieval_cfg.get("sparse_weight", 0.35)),
+            dense_retriever=self._dense_retriever,
+        )
+        self.local_kb_status = self.local_retriever.status()
+        if bool(self.agent_cfg.get("enable_local_retrieval", False)) and not self.local_kb_status.usable:
+            self.agent_cfg["local_retrieval_available"] = False
+        if bool(self.agent_cfg.get("enable_domain_skills", True)) and not self.skill_path.exists():
+            self.agent_cfg["domain_skills_available"] = False
+        self.enabled_tool_specs = self.tool_registry.enabled_specs(self.agent_cfg, self.web_cfg)
+        self.enabled_tool_names = self.tool_registry.enabled_names(self.agent_cfg, self.web_cfg)
+        self.planner_system_prompt = build_planner_system_prompt(self.enabled_tool_specs)
         model_cfg = config.raw.get("model", {})
         request_timeout = int(config.raw.get("runtime", {}).get("request_timeout_seconds", 20))
         tool_timeout = int(self.agent_cfg.get("tool_timeout_seconds", request_timeout))
@@ -144,17 +162,13 @@ class OpenHandsEvidenceRuntime:
             html_provider=str(self.agent_cfg.get("search_provider", "duckduckgo")),
         )
         self.domain_tool = DomainSkillExecutor(
-            skill_path=self._skill_path(),
+            skill_path=self.skill_path,
             forbidden_roots=[config.image_root, config.dataset_path.parent / "2025"],
         )
         self.local_tool = LocalRetrieveExecutor(
-            HacksterHybridRetriever(
-                index_dir=self._local_kb_index_dir(),
-                embedding_model=str(self.retrieval_cfg.get("embedding_model", DEFAULT_EMBEDDING_MODEL)),
-                dense_weight=float(self.retrieval_cfg.get("dense_weight", 0.65)),
-                keyword_weight=float(self.retrieval_cfg.get("keyword_weight", 0.35)),
-            ),
-            enabled=bool(self.agent_cfg.get("enable_local_retrieval", False)),
+            self.local_retriever,
+            enabled=bool(self.agent_cfg.get("enable_local_retrieval", False))
+            and bool(self.agent_cfg.get("local_retrieval_available", True)),
         )
         self.read_tool = RobustWebReadExecutor(
             timeout=web_read_timeout,
@@ -178,7 +192,7 @@ class OpenHandsEvidenceRuntime:
         plan = AgentPlan(
             question_type=self._classify(sample.question_text),
             needs_images=bool(image_paths) and bool(self.agent_cfg.get("use_images", True)),
-            needs_local_retrieval=bool(self.agent_cfg.get("enable_local_retrieval", False)),
+            needs_local_retrieval="local_retrieve" in self.enabled_tool_names,
             needs_web_search=bool(self.agent_cfg.get("enable_web_search", True)),
             queries=[],
             steps=[],
@@ -346,16 +360,19 @@ class OpenHandsEvidenceRuntime:
             fallback.args["_planner_error_type"] = "planner_circuit_open"
             return fallback.to_json(), None
 
+        effective_tool_names = self._effective_tool_names(state)
+        effective_specs = [spec for spec in self.enabled_tool_specs if spec.planner_name in effective_tool_names]
+        planner_system_prompt = build_planner_system_prompt(effective_specs)
         payload, error = self.llm.json_chat(
             [
                 {
                     "role": "system",
-                    "content": PLANNER_SYSTEM_PROMPT,
+                    "content": planner_system_prompt,
                 },
                 {
                     "role": "user",
                     "content": json.dumps(
-                        self._planner_state_payload(state, start, max_total_seconds),
+                        self._planner_state_payload(state, start, max_total_seconds, effective_tool_names=effective_tool_names),
                         ensure_ascii=False,
                     ),
                 },
@@ -372,13 +389,19 @@ class OpenHandsEvidenceRuntime:
         state.planner_failures = 0
         return payload, None
 
+    def _effective_tool_names(self, state: AgentState) -> list[str]:
+        names = list(self.enabled_tool_names)
+        if "local_retrieve" in names and not self._should_use_local_retrieval(state):
+            names = [name for name in names if name != "local_retrieve"]
+        return names
+
     def _validate_action(self, payload: dict[str, Any]) -> tuple[AgentAction | None, ToolSpec | None, str | None]:
         if not isinstance(payload, dict):
             return None, None, "planner action must be a JSON object"
         tool_name = str(payload.get("tool_name") or payload.get("tool") or payload.get("action") or "").strip()
         if tool_name not in self.tool_registry.names():
             return None, None, f"unknown planner tool: {tool_name or '<empty>'}"
-        if tool_name not in self.tool_registry.enabled_names(self.agent_cfg, self.web_cfg):
+        if tool_name not in self.enabled_tool_names:
             return None, self.tool_registry.get(tool_name), f"planner tool disabled by config: {tool_name}"
         args = payload.get("args") or {}
         spec = self.tool_registry.get(tool_name)
@@ -540,6 +563,8 @@ class OpenHandsEvidenceRuntime:
             if state.tool_counts.get("match_domain_skill", 0) >= max_attempts:
                 return "match_domain_skill already collected domain evidence; choose rank_evidence or finish_answer"
         if action.tool_name == "local_retrieve":
+            if not self._should_use_local_retrieval(state):
+                return "local_retrieve reserved for strong entity, formula, topology, or fault gaps; use image evidence, rank_evidence, or finish_answer"
             max_attempts = int(self.agent_cfg.get("max_local_retrieval_calls", 1))
             if state.tool_counts.get("local_retrieve", 0) >= max_attempts:
                 return "local_retrieve query budget exhausted"
@@ -577,14 +602,8 @@ class OpenHandsEvidenceRuntime:
     def _fallback_action(self, state: AgentState) -> AgentAction:
         if state.image_paths and state.tool_counts.get("inspect_image", 0) == 0 and bool(self.agent_cfg.get("use_images", True)):
             return AgentAction("inspect_image", reason="fallback: inspect available input images")
-        if bool(self.agent_cfg.get("enable_domain_skills", True)) and state.tool_counts.get("match_domain_skill", 0) == 0:
+        if "match_domain_skill" in self.enabled_tool_names and state.tool_counts.get("match_domain_skill", 0) == 0:
             return AgentAction("match_domain_skill", reason="fallback: collect domain skill evidence")
-        if bool(self.agent_cfg.get("enable_local_retrieval", False)) and state.tool_counts.get("local_retrieve", 0) == 0:
-            return AgentAction(
-                "local_retrieve",
-                args={"query": self._next_seed_query(state) or state.sample.question_text},
-                reason="fallback: search local Hackster knowledge base",
-            )
         max_queries = int(self.agent_cfg.get("max_web_queries", 3))
         if (
             bool(self.agent_cfg.get("enable_web_search", True))
@@ -605,6 +624,33 @@ class OpenHandsEvidenceRuntime:
             return AgentAction("review_evidence", reason="fallback: check evidence coverage")
         return AgentAction("finish_answer", reason="fallback: finalize answer from available evidence", stop=True)
 
+    def _should_use_local_retrieval(self, state: AgentState) -> bool:
+        question = state.sample.question_text
+        profile = classify_query_terms(question)
+        has_strong_entity = bool(profile.get("models") or profile.get("refdes") or profile.get("values"))
+        has_fault_or_formula_gap = bool(profile.get("fault")) or any(
+            marker in question.lower()
+            for marker in (
+                "公式",
+                "计算",
+                "推导",
+                "选型",
+                "formula",
+                "calculate",
+                "calculation",
+                "layout",
+                "emc",
+                "emi",
+            )
+        )
+        has_topology = bool(profile.get("topology"))
+        has_image_evidence = any(item.metadata.get("kind") in {"image_context", "image_inspection"} for item in state.evidence)
+        if state.image_paths and state.tool_counts.get("inspect_image", 0) == 0:
+            return False
+        if state.image_paths and has_image_evidence and not (has_strong_entity and (has_fault_or_formula_gap or has_topology)):
+            return False
+        return has_strong_entity and (has_fault_or_formula_gap or has_topology)
+
     def _forced_action(self, state: AgentState) -> AgentAction | None:
         if not state.evidence or state.answer:
             return None
@@ -614,7 +660,7 @@ class OpenHandsEvidenceRuntime:
         has_web = any(item.metadata.get("kind") in {"web_search_result", "web_page"} for item in state.evidence)
         has_local = any(item.metadata.get("kind") == "local_kb_chunk" for item in state.evidence)
         has_image = any(item.metadata.get("kind") in {"image_context", "image_inspection"} for item in state.evidence)
-        enough_for_answer = (has_image and (has_domain or has_local)) or has_web or has_local or len(state.evidence) >= 4
+        enough_for_answer = (has_image and has_domain) or has_web or len(state.evidence) >= 4
         if not enough_for_answer:
             return None
         if state.tool_counts.get("rank_evidence", 0) == 0:
@@ -750,7 +796,7 @@ class OpenHandsEvidenceRuntime:
             inputs={
                 "sample_id": state.sample.sample_id,
                 "iteration": state.iteration,
-                "allowed_tools": self.tool_registry.enabled_names(self.agent_cfg, self.web_cfg),
+                "allowed_tools": self.enabled_tool_names,
             },
             outputs={
                 "iteration": state.iteration,
@@ -847,13 +893,20 @@ class OpenHandsEvidenceRuntime:
         inputs.update(sanitized_args)
         return inputs
 
-    def _planner_state_payload(self, state: AgentState, start: float, max_total_seconds: float) -> dict[str, Any]:
+    def _planner_state_payload(
+        self,
+        state: AgentState,
+        start: float,
+        max_total_seconds: float,
+        effective_tool_names: list[str] | None = None,
+    ) -> dict[str, Any]:
+        allowed_tools = effective_tool_names or self._effective_tool_names(state)
         return {
             "question": state.sample.question_text,
             "sample_id": state.sample.sample_id,
             "has_images": bool(state.image_paths),
             "image_count": len(state.image_paths),
-            "allowed_tools": self.tool_registry.enabled_names(self.agent_cfg, self.web_cfg),
+            "allowed_tools": allowed_tools,
             "tool_counts": state.tool_counts,
             "evidence": [
                 {
@@ -870,7 +923,7 @@ class OpenHandsEvidenceRuntime:
             "errors": state.errors[-5:],
             "read_urls": sorted(state.read_urls),
             "budget_remaining": self._budget_remaining(start, max_total_seconds),
-            "guidance": planner_guidance(),
+            "guidance": planner_guidance(allowed_tools),
         }
 
     def _compact_observation_for_planner(self, observation: dict[str, Any]) -> dict[str, Any]:
@@ -923,6 +976,10 @@ class OpenHandsEvidenceRuntime:
                         "answer": self.config.agent_model,
                     },
                     "registry_tools": self.tool_registry.names(),
+                    "enabled_tools": self.enabled_tool_names,
+                    "local_kb": self.local_kb_status.to_json(),
+                    "domain_skills_path": str(self.skill_path),
+                    "domain_skills_exists": self.skill_path.exists(),
                     "tool_contract": "OpenHands SDK ToolDefinition compatibility layer",
                 },
             )
@@ -945,11 +1002,30 @@ class OpenHandsEvidenceRuntime:
         return Path(__file__).resolve().parents[1] / path
 
     def _local_kb_index_dir(self) -> Path:
-        raw_path = self.config.raw.get("paths", {}).get("local_kb_index") or self.config.local_corpus_root / "hackster_cc"
+        raw_path = self.config.raw.get("paths", {}).get("local_kb_index") or self.config.local_corpus_root / "circuit_md_fts"
         path = Path(raw_path)
         if path.is_absolute():
             return path
         return Path(__file__).resolve().parents[1] / path
+
+    def _build_dense_retriever(self):
+        from tools.dense_retriever import DenseRetriever
+        embedding_model = self.retrieval_cfg.get("embedding_model", "")
+        device = self.retrieval_cfg.get("device", "cuda")
+        batch_size = int(self.retrieval_cfg.get("embedding_batch_size", 64))
+        if not embedding_model:
+            return None
+        retriever = DenseRetriever(
+            model_name=embedding_model,
+            index_dir=self.local_kb_index_dir,
+            device=device,
+            batch_size=batch_size,
+        )
+        dense_status = retriever.status()
+        if dense_status.usable:
+            retriever.load_index()
+            return retriever
+        return None
 
     def _classify(self, question: str) -> str:
         upper = question.upper()

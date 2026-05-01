@@ -1,12 +1,26 @@
 from __future__ import annotations
 
+import logging
+import re
 from typing import Any, Dict
 
 from agent.prompts import JUDGE_SYSTEM_PROMPT, build_judge_user_prompt
 from llm_client import LLMClient
 
+logger = logging.getLogger(__name__)
 
-DEFAULT_DISABLED_JUDGE = {
+
+_JUDGE_NUMERIC_FIELDS = {
+    "accuracy": (1, 5),
+    "completeness": (1, 5),
+    "clarity": (1, 5),
+    "usefulness": (1, 5),
+    "average_score": (1.0, 5.0),
+    "factual_consistency": (0.0, 1.0),
+    "score": (0.0, 1.0),
+}
+
+_DEFAULT_DISABLED_JUDGE = {
     "enabled": False,
     "score": 0.0,
     "score_scale": "0-1",
@@ -21,6 +35,35 @@ DEFAULT_DISABLED_JUDGE = {
     "unsupported_claims": [],
     "scoring_point_matches": [],
 }
+
+# Keep old name as alias for backward compat with other modules
+DEFAULT_DISABLED_JUDGE = _DEFAULT_DISABLED_JUDGE
+
+
+def _regex_fallback_extract(raw_text: str) -> Dict[str, Any]:
+    """Extract numeric judge fields from raw LLM text when JSON parsing fails."""
+    result: Dict[str, Any] = {}
+    for field, (lo, hi) in _JUDGE_NUMERIC_FIELDS.items():
+        # Match patterns like "accuracy": 4 or accuracy: 3 or "accuracy": 0.85
+        pattern = rf'"{field}"\s*:\s*([\d.]+)'
+        match = re.search(pattern, raw_text)
+        if not match:
+            pattern = rf'{field}\s*[:=]\s*([\d.]+)'
+            match = re.search(pattern, raw_text)
+        if match:
+            try:
+                val = float(match.group(1))
+                result[field] = val if lo <= val <= hi else lo
+            except ValueError:
+                result[field] = lo
+        else:
+            result[field] = lo
+    bool_match = re.search(r'"fully_correct"\s*:\s*(true|false)', raw_text, re.IGNORECASE)
+    result["fully_correct"] = bool(bool_match and bool_match.group(1).lower() == "true")
+    result["critical_errors"] = []
+    result["unsupported_claims"] = []
+    result["scoring_point_matches"] = []
+    return result
 
 
 class LLMJudge:
@@ -37,16 +80,54 @@ class LLMJudge:
             return dict(DEFAULT_DISABLED_JUDGE)
 
         prompt = build_judge_user_prompt(question, reference, prediction, scoring_points)
-        result, error = self.llm.json_chat(
-            [
-                {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.1,
-        )
-        if error:
+        messages = [
+            {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+        # Single LLM call; try JSON parse → repair → regex fallback on the same response
+        raw_response = self.llm.chat(messages, temperature=0.1)
+        if raw_response.error or not raw_response.content:
+            logger.warning("LLM Judge API call failed for question: %s; error: %s", question[:80], raw_response.error)
             return dict(DEFAULT_DISABLED_JUDGE)
-        return normalize_unified_judge(result, enabled=True)
+
+        text = raw_response.content.strip()
+        # Strip markdown code fences
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        start = text.find("{")
+        if start >= 0:
+            text = text[start:]
+
+        # Try 1: direct JSON parse
+        import json
+        try:
+            end = text.rfind("}") + 1
+            if end > start:
+                result = json.loads(text[:end])
+                if isinstance(result, dict):
+                    return normalize_unified_judge(result, enabled=True)
+        except json.JSONDecodeError:
+            pass
+
+        # Try 2: JSON repair (handles truncated responses)
+        from llm_client import _repair_truncated_json
+        repaired = _repair_truncated_json(text)
+        if repaired is not None:
+            logger.info("JSON repair succeeded for question: %s", question[:60])
+            return normalize_unified_judge(repaired, enabled=True)
+
+        # Try 3: regex fallback (extracts core numeric fields from raw text)
+        extracted = _regex_fallback_extract(raw_response.content)
+        if extracted.get("accuracy", 0) > 0 or extracted.get("factual_consistency", 0) > 0:
+            logger.info("Regex fallback succeeded for question: %s", question[:60])
+            return normalize_unified_judge(extracted, enabled=True)
+
+        logger.warning("All parse attempts failed for question: %s", question[:80])
+        return dict(DEFAULT_DISABLED_JUDGE)
 
 
 def normalize_unified_judge(result: Dict[str, Any], enabled: bool = True) -> Dict[str, Any]:

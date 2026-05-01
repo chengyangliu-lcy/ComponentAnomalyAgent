@@ -426,6 +426,7 @@ def main() -> None:
         summary = summarize_scores(
             eval_rows,
             final_weights=eval_cfg.get("final_weights"),
+            predictions=predictions,
         )
         summary["error_analysis"] = build_error_analysis(eval_rows)
         write_json(
@@ -433,6 +434,7 @@ def main() -> None:
             summarize_scores(
                 eval_rows,
                 final_weights=eval_cfg.get("final_weights"),
+                predictions=predictions,
             ),
         )
     hard_failed = [row for row in predictions if is_hard_failed_prediction(row)]

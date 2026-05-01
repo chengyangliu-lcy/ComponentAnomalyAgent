@@ -1,0 +1,12 @@
+paths:
+  local_kb_index: knowledge_base/circuit_diagnosis_fts
+
+agent:
+  enable_local_retrieval: true
+
+retrieval:
+  embedding_model: Qwen/Qwen3-Embedding-4B
+  dense_weight: 0.65
+  sparse_weight: 0.35
+  device: cuda
+  embedding_batch_size: 64

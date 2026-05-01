@@ -6,13 +6,14 @@ from pathlib import Path
 import unittest
 from uuid import uuid4
 
-from agent.openhands_runtime import OpenHandsEvidenceRuntime
+from agent.openhands_runtime import AgentState, OpenHandsEvidenceRuntime
 from agent.prompts import PLANNER_SYSTEM_PROMPT
 from agent.tool_registry import DEFAULT_TOOL_REGISTRY
 from configs.config import RuntimeConfig
 from schemas import ImageRef, StandardSample
 from tools.evidence_tools import ToolRun
 from schemas import Evidence
+from tools.circuit_kb import build_circuit_md_kb
 
 
 class ScriptedPlanner:
@@ -98,6 +99,29 @@ class AgenticRuntimeTests(unittest.TestCase):
     def test_prompt_and_registry_tool_names_stay_in_sync(self) -> None:
         for tool_name in DEFAULT_TOOL_REGISTRY.planner_tool_names():
             self.assertIn(tool_name, PLANNER_SYSTEM_PROMPT)
+
+    def test_planner_guidance_limits_local_retrieval_to_strong_gaps(self) -> None:
+        from agent.prompts import planner_guidance
+
+        guidance = planner_guidance(["inspect_image", "local_retrieve", "finish_answer"])
+
+        self.assertIn("诊断信息", guidance)
+        self.assertIn("KB 证据不会进入最终答案", guidance)
+
+    def test_disabled_or_missing_resource_tools_are_not_exposed_to_planner(self) -> None:
+        with self._runtime(
+            agent_overrides={"enable_domain_skills": False, "enable_local_retrieval": True}
+        ) as runtime:
+            self.assertNotIn("match_domain_skill", runtime.enabled_tool_names)
+            self.assertNotIn("local_retrieve", runtime.enabled_tool_names)
+            self.assertNotIn("match_domain_skill", runtime.planner_system_prompt)
+            self.assertNotIn("local_retrieve", runtime.planner_system_prompt)
+
+    def test_valid_local_kb_resource_is_exposed_to_planner(self) -> None:
+        with self._runtime(agent_overrides={"enable_local_retrieval": True}, create_local_kb=True) as runtime:
+            self.assertIn("local_retrieve", runtime.enabled_tool_names)
+            self.assertIn("local_retrieve", runtime.planner_system_prompt)
+            self.assertTrue(runtime.local_kb_status.usable)
 
     def test_scripted_valid_actions_drive_loop(self) -> None:
         with self._runtime() as runtime:
@@ -202,6 +226,76 @@ class AgenticRuntimeTests(unittest.TestCase):
         domain_events = [event for event in result.tool_trace if event.tool_name == "domain_skill"]
         self.assertEqual(len(domain_events), 1)
         self.assertTrue(result.answer)
+
+    def test_fallback_does_not_use_local_retrieval_for_image_only_board_questions(self) -> None:
+        with self._runtime(
+            agent_overrides={"enable_domain_skills": False, "enable_web_search": False, "enable_local_retrieval": True},
+            create_local_kb=True,
+        ) as runtime:
+            sample = self._sample(
+                "请根据图片判断这个板子的供电连接和拓扑是否正确",
+                images=[ImageRef(original_url="board.png", path=Path("board.png"), exists=True)],
+            )
+            state = AgentState(sample=sample, image_paths=["board.png"])
+            state.tool_counts["inspect_image"] = 1
+            state.evidence.append(
+                Evidence(
+                    source="local_images",
+                    title="image inspection",
+                    content="图片显示板级供电连接和若干电感。",
+                    metadata={"kind": "image_inspection"},
+                )
+            )
+
+            action = runtime._fallback_action(state)
+
+        self.assertEqual(action.tool_name, "rank_evidence")
+
+    def test_fallback_ranks_existing_evidence_before_local_retrieval_even_with_strong_terms(self) -> None:
+        with self._runtime(
+            agent_overrides={"enable_domain_skills": False, "enable_web_search": False, "enable_local_retrieval": True},
+            create_local_kb=True,
+        ) as runtime:
+            sample = self._sample("MC34063 buck LED 电流采样纹波怎么处理")
+            state = AgentState(sample=sample, image_paths=[])
+            state.evidence.append(
+                Evidence(
+                    source="domain",
+                    title="current sense prior",
+                    content="已有电流采样和纹波处理证据。",
+                    metadata={"kind": "domain_skill"},
+                )
+            )
+
+            action = runtime._fallback_action(state)
+
+        self.assertEqual(action.tool_name, "rank_evidence")
+
+    def test_planner_state_hides_local_retrieval_when_current_sample_is_not_eligible(self) -> None:
+        with self._runtime(
+            agent_overrides={"enable_domain_skills": False, "enable_web_search": False, "enable_local_retrieval": True},
+            create_local_kb=True,
+        ) as runtime:
+            sample = self._sample(
+                "请根据图片判断这个板子的供电连接和拓扑是否正确",
+                images=[ImageRef(original_url="board.png", path=Path("board.png"), exists=True)],
+            )
+            state = AgentState(sample=sample, image_paths=["board.png"])
+            state.tool_counts["inspect_image"] = 1
+            state.evidence.append(
+                Evidence(
+                    source="local_images",
+                    title="image inspection",
+                    content="图片显示板级供电连接。",
+                    metadata={"kind": "image_inspection"},
+                )
+            )
+
+            allowed = runtime._effective_tool_names(state)
+            payload = runtime._planner_state_payload(state, start=0.0, max_total_seconds=20.0, effective_tool_names=allowed)
+
+        self.assertNotIn("local_retrieve", allowed)
+        self.assertNotIn("local_retrieve", payload["allowed_tools"])
 
     def test_web_search_query_is_repaired_and_limit_is_clipped(self) -> None:
         with self._runtime(
@@ -311,8 +405,14 @@ class AgenticRuntimeTests(unittest.TestCase):
         image_root: Path | None = None,
         agent_overrides: dict | None = None,
         web_overrides: dict | None = None,
+        create_local_kb: bool = False,
     ):
-        return _RuntimeContext(image_root=image_root, agent_overrides=agent_overrides, web_overrides=web_overrides)
+        return _RuntimeContext(
+            image_root=image_root,
+            agent_overrides=agent_overrides,
+            web_overrides=web_overrides,
+            create_local_kb=create_local_kb,
+        )
 
     def _sample(self, question: str, images: list[ImageRef] | None = None) -> StandardSample:
         return StandardSample(
@@ -340,6 +440,7 @@ class _RuntimeContext:
         image_root: Path | None = None,
         agent_overrides: dict | None = None,
         web_overrides: dict | None = None,
+        create_local_kb: bool = False,
     ) -> None:
         self.temp_dir = _workspace_tempdir()
         self.root: Path | None = None
@@ -348,6 +449,7 @@ class _RuntimeContext:
         self.runtime: OpenHandsEvidenceRuntime | None = None
         self.agent_overrides = agent_overrides or {}
         self.web_overrides = web_overrides or {}
+        self.create_local_kb = create_local_kb
 
     def __enter__(self) -> OpenHandsEvidenceRuntime:
         self.root = Path(self.temp_dir.__enter__())
@@ -370,6 +472,27 @@ skills:
 """,
             encoding="utf-8",
         )
+        local_kb_index = local_corpus / "circuit_md_fts"
+        if self.create_local_kb:
+            source = self.root / "circuit_pages"
+            source.mkdir()
+            (source / "page_1.md").write_text(
+                (
+                    """
+**标题**: MC34063 buck LED constant current driver
+
+**链接**: https://example.com/mc34063
+
+**发布时间**: 未知
+
+MC34063 buck LED constant current driver uses current sense feedback and inductor switching.
+""".strip()
+                    + "\n\n"
+                    + "MC34063 buck LED constant current driver uses current sense feedback and inductor switching. " * 8
+                ),
+                encoding="utf-8",
+            )
+            build_circuit_md_kb(source, local_kb_index, max_docs=10, min_chunk_chars=120)
         dataset_path = self.root / "dataset.jsonl"
         dataset_path.write_text("", encoding="utf-8")
         self.image_root.mkdir(parents=True, exist_ok=True)
@@ -378,6 +501,7 @@ skills:
                 "dataset": str(dataset_path),
                 "image_root": str(self.image_root),
                 "local_corpus_root": str(local_corpus),
+                "local_kb_index": str(local_kb_index),
                 "outputs_dir": str(self.root / "outputs"),
                 "logs_dir": str(self.root / "logs"),
             },
