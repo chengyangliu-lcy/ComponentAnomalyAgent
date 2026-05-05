@@ -1,0 +1,20 @@
+# Exp 6: Phase A — Answer Precision + Anti-Hallucination + Evidence Compression
+# Inherits Tier 1 pipeline fixes, adds answer quality improvements
+
+paths:
+  local_kb_index: knowledge_base/circuit_diagnosis_fts
+
+agent:
+  enable_local_retrieval: true
+  max_local_retrieval_calls: 2
+  max_local_docs: 4
+  max_local_chunks: 6
+  enable_web_search: true
+  web_search_mode: auto
+
+retrieval:
+  embedding_model: 'Qwen/Qwen3-Embedding-4B'
+  dense_weight: 0.65
+  sparse_weight: 0.35
+  device: cuda
+  embedding_batch_size: 64

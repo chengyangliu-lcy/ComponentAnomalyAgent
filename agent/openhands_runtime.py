@@ -123,7 +123,7 @@ class OpenHandsEvidenceRuntime:
             max_tokens=int(self.agent_cfg.get("planner_max_tokens", 700)),
             timeout=planner_timeout,
             max_retries=max_retries,
-            extra_body=model_cfg.get("planner_extra_body", {}),
+            extra_body=config.planner_extra_body,
         )
         self.answer_llm = LLMClient(
             api_key=config.api_key,
@@ -133,7 +133,7 @@ class OpenHandsEvidenceRuntime:
             max_tokens=int(model_cfg.get("max_tokens", 2000)),
             timeout=final_answer_timeout,
             max_retries=max_retries,
-            extra_body=model_cfg.get("answer_extra_body", {}),
+            extra_body=config.answer_extra_body,
         )
         self.image_llm = LLMClient(
             api_key=config.api_key,
@@ -143,7 +143,7 @@ class OpenHandsEvidenceRuntime:
             max_tokens=int(self.agent_cfg.get("image_inspection_max_tokens", 800)),
             timeout=vision_timeout,
             max_retries=0,
-            extra_body=model_cfg.get("vision_extra_body", {}),
+            extra_body=config.vision_extra_body,
         )
         self.sdk_status = self._inspect_openhands_sdk()
         self.image_tool = ImageInspectExecutor(
@@ -327,7 +327,6 @@ class OpenHandsEvidenceRuntime:
         plan.queries = state.queries
         plan.selected_actions = state.selected_actions
         plan.final_stop_reason = state.final_stop_reason
-        plan.budgets["elapsed_seconds"] = round(elapsed_total, 4)
         return InferenceResult(
             sample_id=sample.sample_id,
             question=sample.question_text,
@@ -627,29 +626,57 @@ class OpenHandsEvidenceRuntime:
     def _should_use_local_retrieval(self, state: AgentState) -> bool:
         question = state.sample.question_text
         profile = classify_query_terms(question)
-        has_strong_entity = bool(profile.get("models") or profile.get("refdes") or profile.get("values"))
-        has_fault_or_formula_gap = bool(profile.get("fault")) or any(
-            marker in question.lower()
-            for marker in (
-                "公式",
-                "计算",
-                "推导",
-                "选型",
-                "formula",
-                "calculate",
-                "calculation",
-                "layout",
-                "emc",
-                "emi",
-            )
+
+        # Scoring-based trigger instead of strict AND gate
+        score = 0.0
+
+        # Strong entity signals (models, refdes, values) — each category up to 3.0
+        models = profile.get("models") or []
+        refdes = profile.get("refdes") or []
+        values = profile.get("values") or []
+        if models:
+            score += min(3.0, len(models) * 1.5)
+        if refdes:
+            score += min(3.0, len(refdes) * 1.5)
+        if values:
+            score += min(3.0, len(values) * 1.0)
+
+        # Topology signals — up to 2.0
+        if profile.get("topology"):
+            score += min(2.0, len(profile["topology"]) * 1.0)
+
+        # Fault signals — up to 2.0
+        if profile.get("fault"):
+            score += min(2.0, len(profile["fault"]) * 1.0)
+
+        # Formula / computation / design keywords — 2.0
+        formula_markers = (
+            "公式", "计算", "推导", "选型", "formula", "calculate",
+            "calculation", "layout", "emc", "emi", "参数", "设计",
         )
-        has_topology = bool(profile.get("topology"))
-        has_image_evidence = any(item.metadata.get("kind") in {"image_context", "image_inspection"} for item in state.evidence)
+        if any(marker in question.lower() for marker in formula_markers):
+            score += 2.0
+
+        # Boost when web_search would be the alternative (no existing web evidence)
+        has_web_evidence = any(
+            item.metadata.get("kind") in {"web_search_result", "web_page"}
+            for item in state.evidence
+        )
+        if not has_web_evidence and state.tool_counts.get("web_search", 0) == 0:
+            score += 1.0
+
+        # Image deferral: only defer KB when images exist, uninspected, and entity score is low
+        has_image_evidence = any(
+            item.metadata.get("kind") in {"image_context", "image_inspection"}
+            for item in state.evidence
+        )
         if state.image_paths and state.tool_counts.get("inspect_image", 0) == 0:
+            if score < 4.0:
+                return False
+        if state.image_paths and has_image_evidence and score < 2.0:
             return False
-        if state.image_paths and has_image_evidence and not (has_strong_entity and (has_fault_or_formula_gap or has_topology)):
-            return False
-        return has_strong_entity and (has_fault_or_formula_gap or has_topology)
+
+        return score >= 2.0
 
     def _forced_action(self, state: AgentState) -> AgentAction | None:
         if not state.evidence or state.answer:
@@ -660,7 +687,7 @@ class OpenHandsEvidenceRuntime:
         has_web = any(item.metadata.get("kind") in {"web_search_result", "web_page"} for item in state.evidence)
         has_local = any(item.metadata.get("kind") == "local_kb_chunk" for item in state.evidence)
         has_image = any(item.metadata.get("kind") in {"image_context", "image_inspection"} for item in state.evidence)
-        enough_for_answer = (has_image and has_domain) or has_web or len(state.evidence) >= 4
+        enough_for_answer = (has_image and has_domain) or has_web or has_local or len(state.evidence) >= 4
         if not enough_for_answer:
             return None
         if state.tool_counts.get("rank_evidence", 0) == 0:
@@ -969,7 +996,7 @@ class OpenHandsEvidenceRuntime:
                     "question_type": plan.question_type,
                     "needs_images": plan.needs_images,
                     "needs_web_search": plan.needs_web_search,
-                    "budgets": plan.budgets,
+                    "budgets": dict(plan.budgets),
                     "models": {
                         "planner": self.config.agent_model,
                         "vision": self.config.vision_model,
@@ -1029,11 +1056,11 @@ class OpenHandsEvidenceRuntime:
 
     def _classify(self, question: str) -> str:
         upper = question.upper()
-        if any(term in upper for term in ["LLC", "DCDC", "TL431", "MOS", "PFC"]) or "鐢垫簮" in question:
+        if any(term in upper for term in ["LLC", "DCDC", "TL431", "MOS", "PFC"]) or "电源" in question:
             return "power_supply"
-        if any(term in question for term in ["璋冨厜", "杩愭斁", "LM358"]):
+        if any(term in question for term in ["调光", "运放", "LM358"]):
             return "analog_driver_debugging"
-        if any(term in question for term in ["璐熸帶", "姝ｆ帶", "淇濇姢鏉?"]):
+        if any(term in question for term in ["负控", "正控", "保护"]):
             return "battery_protection_switching"
         return "general_component_anomaly"
 

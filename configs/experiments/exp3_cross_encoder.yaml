@@ -1,0 +1,26 @@
+# Exp 3: Tier 1 + Cross-Encoder Reranking
+# Inherits default.yaml; adds cross-encoder reranking
+
+paths:
+  local_kb_index: knowledge_base/circuit_diagnosis_fts
+
+agent:
+  enable_local_retrieval: true
+  max_local_retrieval_calls: 2
+  max_local_docs: 4
+  max_local_chunks: 6
+  enable_web_search: true
+  web_search_mode: auto
+
+retrieval:
+  embedding_model: 'Qwen/Qwen3-Embedding-4B'
+  dense_weight: 0.65
+  sparse_weight: 0.35
+  device: cuda
+  embedding_batch_size: 64
+  enable_cross_encoder_rerank: true
+  cross_encoder_model: 'BAAI/bge-reranker-v2-m3'
+  cross_encoder_top_n: 30
+  hybrid_score_threshold: 0.08
+  high_relevance_threshold: 0.4
+  max_chunks_per_url: 3

@@ -1,0 +1,21 @@
+# Exp 12: No KB baseline — local_retrieval disabled
+# Matches exp11 config except KB is off
+# Goal: isolate KB effect
+
+paths:
+  local_kb_index: knowledge_base/circuit_diagnosis_fts_hq_v2
+
+agent:
+  enable_local_retrieval: false
+  max_local_retrieval_calls: 0
+  max_local_docs: 0
+  max_local_chunks: 0
+  enable_web_search: true
+  web_search_mode: auto
+
+retrieval:
+  embedding_model: 'Qwen/Qwen3-Embedding-4B'
+  dense_weight: 0.65
+  sparse_weight: 0.35
+  device: cuda
+  embedding_batch_size: 64

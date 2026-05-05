@@ -8,7 +8,7 @@ paths:
   logs_dir: logs
 
 model:
-  provider: dashscope_openai_compatible
+  provider: dashscope    # "dashscope" or "vllm" — controls extra_body format for thinking mode
   api_key_env: DASHSCOPE_API_KEY
   base_url_env: DASHSCOPE_BASE_URL
   default_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1

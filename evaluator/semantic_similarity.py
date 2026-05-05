@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from pathlib import Path
 from typing import Optional
 
 
@@ -22,7 +24,7 @@ class SemanticSimilarity:
         device: str | None = None,
     ) -> None:
         self.backend = backend
-        self.bertscore_model = bertscore_model
+        self.bertscore_model = self._resolve_model_path(bertscore_model)
         self.bertscore_num_layers = bertscore_num_layers
         self.sentence_model = sentence_model
         self.device = device
@@ -30,6 +32,13 @@ class SemanticSimilarity:
         self._bertscore_error: str | None = None
         self._sentence_model = None
         self._sentence_error: str | None = None
+
+    @staticmethod
+    def _resolve_model_path(model: str) -> str:
+        path = Path(model)
+        if path.is_dir():
+            return str(path.resolve())
+        return model
 
     def score(self, reference: str, prediction: str) -> SemanticResult:
         if not reference and not prediction:
@@ -61,9 +70,14 @@ class SemanticSimilarity:
             if self._bertscore_error:
                 return SemanticResult(0.0, "bertscore", self._bertscore_error)
             if self._bertscore_scorer is None:
+                num_layers = self.bertscore_num_layers
+                if num_layers is None and os.path.isdir(self.bertscore_model):
+                    num_layers = 8
+                os.environ.setdefault("HF_HUB_OFFLINE", "1")
+                os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
                 kwargs = {
                     "model_type": self.bertscore_model,
-                    "num_layers": self.bertscore_num_layers,
+                    "num_layers": num_layers,
                     "lang": "zh",
                 }
                 if self.device:

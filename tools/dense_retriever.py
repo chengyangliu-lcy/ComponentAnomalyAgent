@@ -136,6 +136,8 @@ class DenseRetriever:
             error=error,
         )
 
+    MAX_ENCODE_LENGTH = 2048  # truncate inputs to avoid OOM on large models
+
     def load_model(self) -> None:
         from sentence_transformers import SentenceTransformer
 
@@ -143,11 +145,13 @@ class DenseRetriever:
         kwargs: dict[str, Any] = {}
         if self.device:
             kwargs["device"] = self.device
+        kwargs["model_kwargs"] = {"torch_dtype": "float16"}
         if local_dir is not None:
             kwargs["local_files_only"] = True
             self._model = SentenceTransformer(str(local_dir), **kwargs)
         else:
             self._model = SentenceTransformer(self.model_name, **kwargs)
+        self._model.max_seq_length = self.MAX_ENCODE_LENGTH
 
     def build_index(self, db_path: Path | str, *, progress_every: int = 0) -> dict[str, Any]:
         """Build dense embeddings from all chunks in SQLite KB."""

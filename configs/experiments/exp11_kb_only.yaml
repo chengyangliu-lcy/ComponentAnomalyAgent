@@ -1,0 +1,21 @@
+# Exp 11: v2 KB only — everything else same as Exp1 baseline
+# Only difference from exp1_tier1: uses v2 HQ KB instead of old KB
+# Goal: isolate KB effect from retrieval/reranking/rewriting features
+
+paths:
+  local_kb_index: knowledge_base/circuit_diagnosis_fts_hq_v2
+
+agent:
+  enable_local_retrieval: true
+  max_local_retrieval_calls: 2
+  max_local_docs: 4
+  max_local_chunks: 6
+  enable_web_search: true
+  web_search_mode: auto
+
+retrieval:
+  embedding_model: 'Qwen/Qwen3-Embedding-4B'
+  dense_weight: 0.65
+  sparse_weight: 0.35
+  device: cuda
+  embedding_batch_size: 64

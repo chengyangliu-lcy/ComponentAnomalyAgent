@@ -90,6 +90,7 @@ runtime 能力：
 - `extra_body`，用于 DashScope/Qwen 的 `enable_thinking: false` 等参数。
 - `response_format`，用于 planner/Judge JSON 输出。
 - `json_chat` 自动剥离 Markdown code fence 并解析 JSON。
+- `_repair_truncated_json`：对截断或格式错误的 JSON 尝试修复——自动补齐闭合括号，逐步移除尾部残缺片段后重新解析。对 `max_tokens` 不足导致的截断（如 score ~4935 chars 处截断）已验证可修复。
 
 默认模型配置位于 `configs/default.yaml`：
 
@@ -97,6 +98,7 @@ runtime 能力：
 - `VISION_MODEL` / `default_vision_model`
 - `JUDGE_MODEL` / `default_judge_model`
 - planner、vision、answer 分别可配置 `extra_body`
+- judge 专用 `max_tokens` 通过 `evaluation.judge_max_tokens` 配置，默认 4000（独立于 `model.max_tokens`）
 
 ### 6. 联网证据检索
 
@@ -146,6 +148,73 @@ runtime 能力：
 - `errors`
 - `plan`
 
+### 7.5 知识库检索策略
+
+当前知识库是 `knowledge_base/circuit_diagnosis_fts`（SQLite FTS5 + Dense 向量索引），存储从 elecfans.com 等电子技术网站爬取的电路诊断技术文档（12,111 条候选 chunks）。
+
+**检索方式**：混合检索（Dense 65% + Sparse 35%）
+
+- Dense：Qwen3-Embedding-4B 向量检索，语义匹配
+- Sparse：SQLite FTS5 + BM25 重排序，关键词匹配
+- 合并后按 hybrid score 排序，每 URL 最多取 2 chunks
+
+**多层过滤**（候选 → 高相关性仅保留 12.2%）：
+
+1. 低价值来源过滤（非技术类 URL）
+2. 水文/模板文本过滤
+3. 低价值项目过滤
+4. Required terms 过滤（query 关键词须在结果中出现）
+5. 低相关性过滤（sparse score < 5.0 或 hybrid score < 0.15）
+
+**调用门槛**（`openhands_runtime._should_use_local_retrieval`）：
+
+- 必须同时满足：有强实体（型号/位号/参数值）+ 有故障/公式/拓扑需求
+- 如果有图片证据但缺上述条件，优先用图片而跳过 KB
+- 每样本最多调用 1 次，返回最多 4 chunks
+
+配置入口：
+
+- `agent.enable_local_retrieval`
+- `agent.max_local_retrieval_calls`
+- `agent.max_local_docs`
+- `agent.max_local_chunks`
+- `retrieval.embedding_model`
+- `retrieval.dense_weight` / `retrieval.sparse_weight`
+
+### 7.6 最新实验对比（2025-05-01）
+
+两组实验各 368 样本，对比有知识库 vs 无知识库的效果：
+
+| 指标 | 有 KB (kb_rag_full_v4_web) | 无 KB (agent_full_v4) | Delta |
+|---|---|---|---|
+| final_score mean | 0.5809 | 0.5805 | +0.004 |
+| llm_judge score | 0.6877 | 0.677 | +0.011 |
+| accuracy | 3.51 | 3.45 | +0.07 |
+| factual_consistency | 0.728 | 0.711 | +0.017 |
+| semantic_similarity | 0.767 | 0.767 | ~0 |
+| scoring_point_coverage | 0.389 | 0.401 | -0.012 |
+| fully_correct | 3/368 | 1/368 | +2 |
+
+逐样本胜负：RAG 赢 152 / Agent 赢 149 / 平局 67。
+
+**核心结论**：知识库几乎未带来提升（final_score 差仅 0.004），三大原因：
+
+1. **检索门槛太严**：只在"强实体 + 故障/拓扑"时触发，55% 的题目不调 KB
+2. **过滤太狠**：候选 2329 → 保留 283（88% 被丢弃），检索非空率仅 49%
+3. **知识利用率为 0**：`kb_evidence_used_rate = 0.27%`，planner 拿到 KB 内容后未有效融入答案
+
+KB 诊断数据（kb_rag 实验）：
+
+| 指标 | 值 |
+|---|---|
+| local_retrieve 触发率 | 167/368 = 45.4% |
+| 检索非空率 | 49.1% |
+| avg_chunks 返回 | 1.7 |
+| KB 证据用于答案率 | 0.27% |
+| 候选 → 高相关性 | 283/2329 = 12.2% |
+
+潜在改进方向：放宽检索触发条件和过滤策略；优化 planner prompt 让其更积极将 KB 知识融入答案。
+
 ### 8. 统一评测体系
 
 统一评测入口是 `scripts/run_eval.py` 和 `evaluator/evaluate.py`。
@@ -153,48 +222,67 @@ runtime 能力：
 已实现指标：
 
 - Semantic Similarity：优先 BERTScore，可 fallback 到 sentence-transformer。
-- ROUGE-L。
-- Bigram Jaccard。
-- LLM Judge。
-- Scoring point coverage。
-- Error analysis。
+- Claim ROUGE-L：分 claim 加权评分。
+- Scoring point coverage：结构化采分点覆盖率（hit/partial/missed/contradicted）。
+- Technical entity match：idf-weighted F-beta，含 precision/recall/unsupported entity 惩罚。
+- LLM Judge：多维度质量评判（accuracy/completeness/clarity/usefulness/factual_consistency）。
+- Error analysis：自动诊断低分原因和严重级别。
 
-综合分公式：
+综合分公式（当前权重，与旧版不同）：
 
 ```text
-FinalScore = 0.50 * LLMJudgeScore
-           + 0.25 * SemanticSimilarity
-           + 0.10 * ScoringPointCoverage
-           + 0.10 * RougeL
-           + 0.05 * BigramJaccard
+FinalScore = 0.45 * LLMJudgeScore
+           + 0.25 * ScoringPointCoverage
+           + 0.20 * SemanticSimilarity
+           + 0.05 * ClaimRougeL
+           + 0.05 * TechnicalEntityMatch
 
-LegacyFinalScore = 0.60 * SemanticSimilarity
-                 + 0.25 * RougeL
-                 + 0.15 * BigramJaccard
+LLMJudgeScore = 0.35 * accuracy_norm
+              + 0.25 * completeness_norm
+              + 0.20 * factual_consistency
+              + 0.10 * usefulness_norm
+              + 0.10 * clarity_norm
 ```
+
+当 LLM Judge 被禁用/失败时，对应权重自动重分配到其余指标。当采分点 coverage 为 null 时同样跳过重分配。
 
 评测输出字段：
 
-- `semantic_similarity`
-- `claim_rouge_l`
-- `technical_entity_match`
-- `llm_judge`
-- `scoring_points`
+- `semantic_similarity`（score + backend + error）
+- `claim_rouge_l`（score + claims + claim_scores + claim_weights）
+- `technical_entity_match`（score/precision/recall/f1/f_beta + 各类实体列表）
+- `llm_judge`（enabled + score + accuracy/completeness/clarity/usefulness/average_score/factual_consistency + fully_correct + critical_errors）
+- `scoring_points`（reference_points + hit/missed/false_positive + coverage + matches + structured_points）
 - `final_score`
-- `legacy_final_score`
-- `error_analysis`
+- `fully_correct`
+- `error_analysis`（reasons + severity）
+- `elapsed_seconds`
 
-`llm_judge` 是唯一 LLM 评分字段，内部保留 qwen-style 的：
+#### LLM Judge 可靠性保障（三层兜底）
 
-- `accuracy`
-- `completeness`
-- `clarity`
-- `usefulness`
-- `average_score`
-- `score`
-- `factual_consistency`
+`evaluator/llm_judge.py` 的 `judge()` 方法现在对同一个 LLM 响应依次尝试三层解析：
 
-新结果不再生成 `qwen_judge` 字段。
+1. **直接 JSON 解析**：标准 `json.loads`
+2. **JSON 修复**（`llm_client.py._repair_truncated_json`）：对截断的 JSON 响应自动补齐闭合括号，并尝试移除尾部残缺片段后重新解析
+3. **正则提取**（`llm_judge.py._regex_fallback_extract`）：从原始文本中用正则提取 accuracy/completeness/clarity/usefulness/factual_consistency/score 等核心数值字段
+
+根因修复：judge 专用的 `max_tokens` 从 2000 提升到 4000（通过 `evaluation.judge_max_tokens` 配置项），大幅降低截断概率。
+
+#### 评测修复脚本
+
+`scripts/repair_eval.py` 可对已有实验目录中 LLM Judge 失败的样本单独重新评测：
+
+```bash
+cd ComponentAnomalyAgent && .venv/bin/python scripts/repair_eval.py \
+  --config configs/kb_diagnosis.yaml \
+  --experiment agent_full_v4_rerun \
+  --max-workers 4
+```
+
+#### 评测已知问题
+
+- `run_eval.py` 在高并发 (`--max-workers > 1`) 时，`append_jsonl` 可能产生重复行（8 workers 时观察到 19/387 重复）。需用 `scripts/dedupe_jsonl.py` 或手动去重。
+- DashScope API 在 8 并发下可能触发限流，导致部分样本 LLM Judge 超时（90s timeout），表现为 `llm=0.0000`。建议 `--max-workers 4` 并增大 `request_timeout_seconds`。
 
 ### 9. Qwen Baseline 统一化
 
@@ -229,6 +317,7 @@ LegacyFinalScore = 0.60 * SemanticSimilarity
 - `scripts/select_samples.py`：按 seed 从数据集中抽取固定样本 ID。
 - `scripts/dedupe_jsonl.py`：按 `sample_id/post_id` 去重 JSONL，可保留 first 或 last。
 - `scripts/compare_runs.py`：比较 agent 和 baseline 的统一评测 JSONL。
+- `scripts/repair_eval.py`：对已有实验目录中 LLM Judge 失败的样本单独重新评测。
 - `tools/sample_ids.py`：读取、去重和按顺序过滤样本 ID。
 
 `scripts/compare_runs.py` 能力：
@@ -423,10 +512,23 @@ configs/default.yaml
 - `agent.enable_web_search`
 - `agent.enable_image_inspection_llm`
 - `agent.max_llm_images`
+- `agent.enable_local_retrieval`
+- `agent.max_local_retrieval_calls`
+- `evaluation.enable_llm_judge`
+- `evaluation.judge_max_tokens`（默认 4000，独立于 model.max_tokens）
+- `evaluation.final_weights.llm_judge: 0.45`
+- `evaluation.final_weights.structured_point_coverage: 0.25`
+- `evaluation.final_weights.semantic_similarity: 0.20`
+- `evaluation.final_weights.claim_rouge_l: 0.05`
+- `evaluation.final_weights.technical_entity_match: 0.05`
+- `retrieval.embedding_model`
+- `retrieval.dense_weight: 0.65`
+- `retrieval.sparse_weight: 0.35`
 - `web.provider_order`
 - `web.max_results_per_query`
 - `web.max_pages_to_read`
 - `runtime.max_workers`
+- `runtime.request_timeout_seconds`（judge 和 agent 共用，默认 90）
 - `runtime.resume`
 
 ## 主要文件地图
@@ -447,17 +549,24 @@ configs/default.yaml
 - `tools/image_resolver.py`：图片路径解析。
 - `tools/sample_ids.py`：样本 ID 文件读取和过滤。
 - `tools/utils.py`：JSONL/JSON 写入、文本压缩、timer。
+- `tools/circuit_kb.py`：知识库混合检索（Dense + Sparse + 多层过滤）。
+- `tools/retriever.py`：Dense vector retriever (Qwen3-Embedding-4B)。
 - `evaluator/evaluate.py`：统一评测入口。
-- `evaluator/llm_judge.py`：LLM Judge。
+- `evaluator/llm_judge.py`：LLM Judge（三层兜底：JSON 解析 → 修复 → 正则提取）。
+- `evaluator/rouge_eval.py`：Claim ROUGE-L。
+- `evaluator/semantic_similarity.py`：BERTScore / sentence-transformer。
+- `evaluator/scoring_points.py`：结构化采分点覆盖率。
+- `evaluator/jaccard_eval.py`：技术实体 IDF。
 - `evaluator/report.py`：评测汇总和错误分析。
 - `evaluator/baseline_compare.py`：baseline 对比。
 - `qwen_eval.py`：Qwen baseline 生成和统一评测。
 - `scripts/run_infer.py`：Agent 推理。
 - `scripts/run_eval.py`：评测预测结果。
+- `scripts/repair_eval.py`：修复 LLM Judge 失败的评测条目。
 - `scripts/run_baseline.py`：baseline 结果统一化。
 - `scripts/run_experiment.py`：一键实验。
 - `scripts/compare_runs.py`：agent/baseline 对比报告。
-- `scripts/dedupe_jsonl.py`：JSONL 去重。
+- `scripts/dedupe_jsonl.py`：JSONL 厯重。
 - `scripts/select_samples.py`：固定样本抽取。
 - `tests/`：unittest 测试。
 
@@ -470,4 +579,11 @@ configs/default.yaml
 - `8dd21d9 feat: unify evaluation scoring`
 - `8840b21 feat: improve web evidence retrieval`
 - `fca4066 Initial ComponentAnomalyAgent implementation`
+
+## 最近代码改动（2025-05-01，未提交）
+
+- `llm_client.py`：新增 `_repair_truncated_json`，对截断 JSON 尝试闭合修复
+- `evaluator/llm_judge.py`：三层解析兜底（JSON → 修复 → 正则提取），只做一次 LLM 调用；新增 `_regex_fallback_extract`；日志记录 fallback 情况
+- `evaluator/evaluate.py`：judge `max_tokens` 从 `model.max_tokens` 改为 `evaluation.judge_max_tokens`，默认 4000
+- `scripts/repair_eval.py`：新增修复脚本，只重新评测 LLM Judge 失败的样本
 

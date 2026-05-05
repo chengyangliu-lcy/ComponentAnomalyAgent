@@ -25,6 +25,9 @@ DEFAULT_CHUNK_OVERLAP = 120
 DEFAULT_MIN_CHUNK_CHARS = 160
 DEFAULT_CANDIDATE_LIMIT = 80
 DEFAULT_MIN_RELEVANCE_SCORE = 5.0
+DEFAULT_HYBRID_THRESHOLD = 0.15
+DEFAULT_HIGH_RELEVANCE_THRESHOLD = 0.4
+DEFAULT_MAX_CHUNKS_PER_URL = 2
 DEFAULT_MAX_SOURCE_FILE_BYTES = 2_000_000
 DB_FILENAME = "circuit_md.sqlite"
 
@@ -1201,26 +1204,62 @@ def build_diagnosis_kb(
     return meta
 
 
+class CrossEncoderReranker:
+    """Rerank candidate chunks with a cross-encoder model for better relevance discrimination.
+
+    The cross-encoder performs full text-to-text comparison (not just embedding cosine),
+    which is especially valuable for Chinese-English cross-lingual retrieval.
+    """
+
+    def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3", device: str = "cuda") -> None:
+        self.model_name = model_name
+        self.device = device
+        self._model: Any = None
+
+    def _load(self) -> None:
+        from sentence_transformers import CrossEncoder
+
+        self._model = CrossEncoder(self.model_name, device=self.device)
+
+    def rerank(self, query: str, documents: list[dict[str, Any]], top_k: int = 4) -> list[tuple[float, dict[str, Any]]]:
+        if not documents:
+            return []
+        if self._model is None:
+            self._load()
+        pairs = [(query, doc.get("text", "")) for doc in documents]
+        scores = self._model.predict(pairs, show_progress_bar=False)
+        if hasattr(scores, "tolist"):
+            scores = scores.tolist()
+        ranked = sorted(zip(scores, documents), key=lambda x: float(x[0]), reverse=True)
+        return ranked[:top_k]
+
+
 class CircuitMarkdownRetriever:
     def __init__(
         self,
         index_dir: Path | str,
         *,
         candidate_limit: int = DEFAULT_CANDIDATE_LIMIT,
-        max_chunks_per_url: int = 2,
+        max_chunks_per_url: int = DEFAULT_MAX_CHUNKS_PER_URL,
         min_relevance_score: float = DEFAULT_MIN_RELEVANCE_SCORE,
+        hybrid_threshold: float = DEFAULT_HYBRID_THRESHOLD,
+        high_relevance_threshold: float = DEFAULT_HIGH_RELEVANCE_THRESHOLD,
         dense_weight: float = 0.65,
         sparse_weight: float = 0.35,
         dense_retriever: Any | None = None,
+        cross_encoder_reranker: Any | None = None,
     ) -> None:
         self.index_dir = Path(index_dir)
         self.db_path = self.index_dir / DB_FILENAME
         self.candidate_limit = candidate_limit
         self.max_chunks_per_url = max_chunks_per_url
         self.min_relevance_score = min_relevance_score
+        self.hybrid_threshold = hybrid_threshold
+        self.high_relevance_threshold = high_relevance_threshold
         self.dense_weight = dense_weight
         self.sparse_weight = sparse_weight
         self._dense_retriever = dense_retriever
+        self._cross_encoder_reranker = cross_encoder_reranker
 
     def status(self) -> KbIndexStatus:
         if not self.db_path.exists():
@@ -1356,6 +1395,9 @@ class CircuitMarkdownRetriever:
 
         # Sort candidates by hybrid score
         sorted_candidates = sorted(candidate_chunks.items(), key=lambda item: item[1], reverse=True)
+
+        # First pass: collect rows that pass basic quality filters
+        prefiltered: list[tuple[sqlite3.Row, float]] = []  # (row, hybrid_score)
         for chunk_id, hybrid_score in sorted_candidates:
             row = row_by_id.get(chunk_id)
             if row is None:
@@ -1369,28 +1411,59 @@ class CircuitMarkdownRetriever:
             if is_low_value_project_row(query_profile, row):
                 diagnostics["discarded_low_value_project"] += 1
                 continue
-            # In hybrid mode, skip required-terms filter for dense hits above threshold
-            # (dense retrieval already validates semantic relevance)
             dense_hit_score = dense_scores.get(chunk_id, 0.0)
             is_hybrid = self._dense_retriever is not None and dense_scores
             if not (is_hybrid and dense_hit_score >= 0.3) and not _row_matches_required_terms(query_profile, row):
                 diagnostics["discarded_required_terms"] += 1
                 continue
+            prefiltered.append((row, hybrid_score))
+
+        # Cross-encoder reranking (if enabled)
+        cross_encoder_scores: dict[int, float] = {}
+        if self._cross_encoder_reranker is not None and prefiltered:
+            ce_docs = [
+                {
+                    "chunk_id": int(row["chunk_id"]),
+                    "text": f"{row['title']} {row['text']}",
+                }
+                for row, _ in prefiltered
+            ]
+            try:
+                ce_ranked = self._cross_encoder_reranker.rerank(query, ce_docs, top_k=len(ce_docs))
+                for ce_score, doc in ce_ranked:
+                    cross_encoder_scores[int(doc["chunk_id"])] = float(ce_score)
+                # Re-sort prefiltered by cross-encoder score
+                prefiltered.sort(
+                    key=lambda item: cross_encoder_scores.get(int(item[0]["chunk_id"]), 0.0),
+                    reverse=True,
+                )
+            except Exception:
+                pass  # Fall through to hybrid score ordering
+
+        for row, hybrid_score in prefiltered:
             url_key = str(row["url"] or row["path"] or row["page_id"])
             if per_url[url_key] >= self.max_chunks_per_url:
                 diagnostics["discarded_duplicate_source"] += 1
                 continue
             per_url[url_key] += 1
-            # For pure sparse mode, use original rerank score; for hybrid, use hybrid score
             final_score = hybrid_score
             if self._dense_retriever is None or not dense_scores:
                 if final_score < self.min_relevance_score:
                     diagnostics["discarded_low_relevance"] += 1
                     continue
-            elif hybrid_score < 0.15:
+            elif hybrid_score < self.hybrid_threshold:
                 diagnostics["discarded_low_relevance"] += 1
                 continue
-            high_relevance = final_score >= self.min_relevance_score + 2.0 if (self._dense_retriever is None or not dense_scores) else hybrid_score >= 0.6
+            # Re-determine high relevance using cross-encoder score if available
+            ce_score = cross_encoder_scores.get(int(row["chunk_id"]))
+            if ce_score is not None:
+                high_relevance = ce_score >= 0.5  # CE scores are typically in a narrower range
+            else:
+                high_relevance = (
+                    hybrid_score >= self.high_relevance_threshold
+                    if (is_hybrid and dense_scores)
+                    else final_score >= self.min_relevance_score + 2.0
+                )
             evidence = self._to_evidence(row, final_score, query_profile=query_profile, high_relevance=high_relevance)
             kept.append(evidence)
             if high_relevance:

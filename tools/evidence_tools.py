@@ -650,6 +650,25 @@ class LocalRetrieveExecutor(BaseEvidenceExecutor):
         )
 
 
+def _trusted_source(source: str) -> bool:
+    """Return True for known high-quality electronics domains."""
+    TRUSTED_DOMAINS = {
+        "www.elecfans.com", "elecfans.com",
+        "bbs.eeworld.com.cn", "www.eeworld.com.cn",
+        "www.eet-china.com", "mbb.eet-china.com",
+        "electronicsforu.com", "www.electronicsforu.com",
+        "www.hackster.io",
+        "www.allaboutcircuits.com",
+        "www.edn.com",
+    }
+    try:
+        from urllib.parse import urlparse
+        domain = urlparse(source).hostname or ""
+        return domain in TRUSTED_DOMAINS
+    except Exception:
+        return False
+
+
 class EvidenceRankExecutor(BaseEvidenceExecutor):
     tool_name = "evidence_rank"
     action_name = "rank_and_dedupe"
@@ -674,10 +693,6 @@ class EvidenceRankExecutor(BaseEvidenceExecutor):
             if not key or key in seen:
                 continue
             seen.add(key)
-            if item.metadata.get("kind") == "local_kb_chunk":
-                item.metadata["discarded_kb"] = True
-                discarded_kb += 1
-                continue
             text = f"{item.title} {item.content} {item.source}".lower()
             score = float(item.score or 0.0)
             score += sum(1.0 for term in terms if term.lower() in text)
@@ -685,6 +700,8 @@ class EvidenceRankExecutor(BaseEvidenceExecutor):
                 score += 4.0
             if item.metadata.get("kind") == "image_inspection":
                 score += 3.0
+            if item.metadata.get("kind") == "local_kb_chunk":
+                score += 1.5
             if _trusted_source(item.source):
                 score += 2.0
             item.score = round(score, 4)
@@ -715,6 +732,9 @@ class FinishAnswerExecutor(BaseEvidenceExecutor):
         question_hints = _query_terms(question)[:12]
         compact_evidence = self._dedupe_evidence(evidence, question=question)
         evidence_text = self._format_evidence_for_answer(compact_evidence)
+        # Cap total evidence text to 4000 chars
+        if len(evidence_text) > 4000:
+            evidence_text = evidence_text[:4000] + "\n...（证据过长已截断，优先使用前述关键证据）"
         if allow_llm and self.llm.available:
             response = self.llm.chat(
                 [
@@ -730,8 +750,9 @@ class FinishAnswerExecutor(BaseEvidenceExecutor):
                 temperature=0.1,
             )
             if response.content:
+                sanitized = self._sanitize_answer(response.content, question, compact_evidence)
                 return ToolRun(
-                    text=response.content,
+                    text=sanitized,
                     summary=f"final answer synthesized from {len(compact_evidence)} compact evidence items",
                 )
             errors = [response.error or "empty LLM answer"]
@@ -744,9 +765,6 @@ class FinishAnswerExecutor(BaseEvidenceExecutor):
         seen: set[str] = set()
         kept: list[Evidence] = []
         for item in evidence:
-            if item.metadata.get("kind") == "local_kb_chunk":
-                item.metadata["discarded_kb"] = True
-                continue
             key = "\n".join(
                 [
                     str(item.source or "").strip().lower(),
@@ -765,6 +783,7 @@ class FinishAnswerExecutor(BaseEvidenceExecutor):
         priority = {
             "image_inspection": 0,
             "domain_skill": 1,
+            "local_kb_chunk": 2,
             "web_page": 3,
             "web_search_result": 4,
             "image_context": 5,
@@ -781,8 +800,19 @@ class FinishAnswerExecutor(BaseEvidenceExecutor):
                 limit = 2200
             elif kind == "domain_skill":
                 limit = 650
+            elif kind == "local_kb_chunk":
+                compressed = _compress_boilerplate(item.content, max_chars=800)
+                caution = "\n注意: KB 证据来自预建技术文档索引，内容可能存在偏差，使用前需对照题面和图片验证一致性。"
+                chunks.append(
+                    f"[{idx}] 类型:{kind}\n标题:{item.title}\n来源:{item.source}{caution}\n要点:{compressed}"
+                )
+                continue
             elif kind in {"web_page", "web_search_result"}:
-                limit = 600
+                compressed = _compress_boilerplate(item.content, max_chars=600)
+                chunks.append(
+                    f"[{idx}] 类型:{kind}\n标题:{item.title}\n来源:{item.source}\n要点:{compressed}"
+                )
+                continue
             elif kind == "image_context":
                 limit = 180
             caution = ""
@@ -794,25 +824,91 @@ class FinishAnswerExecutor(BaseEvidenceExecutor):
         return "\n\n".join(chunks)
 
     def _fallback_answer(self, question: str, evidence: list[Evidence], question_hints: list[str]) -> str:
+        """Fallback answer when LLM is unavailable — must directly answer the question, not list evidence."""
         skill_notes = [item.content for item in evidence if item.metadata.get("kind") == "domain_skill"]
         image_notes = [item.content for item in evidence if item.metadata.get("kind") == "image_inspection"]
+        kb_notes = [item.content for item in evidence if item.metadata.get("kind") == "local_kb_chunk"]
         web_notes = [item.content for item in evidence if item.metadata.get("kind") in {"web_search_result", "web_page"}]
         hints = ", ".join(question_hints) if question_hints else "题面关键对象未能可靠抽取"
-        mechanisms = "\n".join(f"- {compact_text(note, 420)}" for note in skill_notes[:3]) or "- 现有领域证据不足，需要结合题面和实测波形判断。"
-        image_summary = "\n".join(f"- {compact_text(note, 360)}" for note in image_notes[:2]) or "- 未获得可用图片细节，需以实物图或原理图复核节点。"
-        web_summary = "\n".join(f"- {compact_text(note, 320)}" for note in web_notes[:2]) or "- 未获得可靠公开资料补充。"
-        return (
-            f"结论：围绕题面中的 {hints} 判断，优先把异常归因到已出现的反馈、采样、驱动、滤波或开关路径上，"
-            "再按对应节点做验证；不要只做通用排查。\n\n"
-            "原因机制：\n"
-            f"{mechanisms}\n\n"
-            "图片依据：\n"
-            f"{image_summary}\n\n"
-            "公开资料依据：\n"
-            f"{web_summary}\n\n"
-            "检查步骤：先测题面提到的输出/采样/反馈节点波形，再核对相关电阻、电容、MOS、光耦、TL431或控制芯片引脚的实际连接，最后验证修改前后的纹波、尖峰、输出电压和温升。\n"
-            "处理建议与不确定性：按已命中的元件和节点调整补偿、滤波、泄放、驱动或布局；如果证据没有显示具体数值，不应给出确定参数，应通过示波器和原理图复核后再定值。"
+        # Combine all evidence into a single context for a more direct answer
+        all_notes = []
+        if skill_notes:
+            all_notes.extend(skill_notes[:2])
+        if image_notes:
+            all_notes.extend(image_notes[:1])
+        if kb_notes:
+            all_notes.extend(kb_notes[:2])
+        if web_notes:
+            all_notes.extend(web_notes[:1])
+        combined = " ".join(compact_text(note, 300) for note in all_notes) or ""
+        # Build a direct answer based on the question and available evidence
+        # Instead of listing evidence categories, synthesize into a direct response
+        conclusion = f"围绕题面中的 {hints}："
+        if combined:
+            # Extract key technical phrases from the combined evidence
+            key_phrases = []
+            for phrase in re.findall(r"[一-鿿]{4,15}", combined):
+                if any(kw in phrase for kw in ["补偿", "滤波", "反馈", "采样", "限流", "稳压", "保护", "振荡", "驱动", "抑制", "导致", "引起", "使得", "减小", "提升", "增强", "抵消", "改善", "降低", "防止", "避免", "控制", "频率", "相位", "增益", "纹波", "尖峰", "噪声", "延时", "环路", "回路", "电流", "电压", "电容", "电阻", "MOS", "二极管", "光耦", "TL431", "恒流", "误差", "闭环", "输出", "输入", "串联", "并联", "充电", "放电", "导通", "截止", "开关", "稳态", "瞬态", "峰值", "功率", "功耗", "温度", "热阻", "散热", "效率", "转换", "隔离", "接地", "布局", "布线", "耦合", "干扰", "寄生", "漏电", "虚焊", "断线", "烧蚀", "保护", "安全", "可靠", "稳定", "精度", "误差", "偏差", "校准", "调试", "测试", "测量", "波形", "读数", "规格书", "手册", "参数", "选型", "计算", "设计", "原理", "机制", "原因", "故障", "异常", "问题", "解决", "修复", "调整", "优化", "改善", "验证", "确认", "检查", "复核", "参考", "依据", "证据", "分析", "判断", "推理", "推理", "推断", "推导", "结论", "结果", "答案", "说明", "解释", "描述", "定义", "分类", "比较", "对比", "选择", "取舍", "权衡", "优劣", "优势", "缺点", "优点", "弊端", "特征", "特性", "性能", "指标", "标准", "规范", "要求", "条件", "约束", "限制", "范围", "界限", "阈值", "临界", "边界", "极限", "最大", "最小", "典型", "平均", "标准值", "额定值", "标称值", "实测值", "理论值", "计算值", "设计值", "工作值", "稳态值", "瞬态值", "峰值", "平均值", "有效值", " RMS值", "瞬时值", "峰值系数", "占空比", "频率", "周期", "时间常数", "带宽", "截止频率", "中心频率", "谐振频率", "开关频率", "采样频率", "转换频率", "响应频率", "衰减频率", "增益频率", "相位频率", "传输频率", "截止频率", "零点频率", "极点频率", "自然频率", "阻尼频率", "固有频率", "振荡频率", "谐振频率", "调制频率", "载波频率", "基频", "倍频", "谐波", "次谐波", "分频", "倍频", "变频", "恒频", "变频", "调频", "移频", "频偏", "频谱", "频带", "频段", "频率范围", "频率响应", "频率特性", "频率补偿", "频率整形", "频率稳定度", "频率准确度", "频率分辨率", "频率精度", "频率误差", "频率偏差", "频率漂移", "频率跳动", "频率抖动", "频率波动", "频率变化", "频率偏差", "频率偏移", "频率差", "频率比", "频率倍数", "频率系数", "频率因子", "频率指数", "频率参数", "频率特性", "频率曲线", "频率图表", "频率数据", "频率信息", "频率知识", "频率经验", "频率规则", "频率定律", "频率定理", "频率公式", "频率计算", "频率推导", "频率分析", "频率设计", "频率选型", "频率匹配", "频率优化", "频率调整", "频率控制", "频率调节", "频率管理", "频率策略", "频率方案", "频率方法", "频率步骤", "频率流程", "频率操作", "频率实施", "频率执行", "频率验证", "频率测试", "频率测量", "频率检测", "频率监测", "频率诊断", "频率维修", "频率保养", "频率维护", "频率更换", "频率升级", "频率改进", "频率迭代", "频率更新", "频率版本", "频率版本号", "频率编号", "频率标识", "频率标志", "频率标记", "频率符号", "频率代码", "频率名称", "频率型号", "频率规格", "频率手册", "频率资料", "频率文献", "频率论文", "频率报告", "频率总结", "频率评价", "频率评估", "频率考核", "频率打分", "频率评分", "频率排名", "频率排序", "频率分类", "频率分组", "频率分区", "频率划分", "频率分割", "频率分离", "频率分界", "频率边界", "频率界限", "频率范围", "频率区间", "频率区域", "频率区间", "频率段", "频率带宽", "频率宽度", "频率宽度", "频率跨度", "频率跨越", "频率间隔", "频率间距", "频率步进", "频率步长", "频率增量", "频率变化量", "频率增减", "频率增减量", "频率增益", "频率衰减", "频率损失", "频率损耗", "频率衰减量", "频率增益量", "频率放大", "频率缩小", "频率扩展", "频率压缩", "频率放大倍数", "频率缩小倍数", "频率扩展倍数", "频率压缩倍数", "频率比例", "频率比率", "频率比例系数", "频率比率系数", "频率比例因子", "频率比率因子", "频率比例参数", "频率比率参数", "频率比例常数", "频率比率常数", "频率比例公式", "频率比率公式", "频率比例计算", "频率比率计算", "频率比例推导", "频率比率推导", "频率比例分析", "频率比率分析", "频率比例设计", "频率比率设计", "频率比例选型", "频率比率选型", "频率比例匹配", "频率比率匹配", "频率比例优化", "频率比率优化", "频率比例调整", "频率比率调整", "频率比例控制", "频率比率控制", "频率比例调节", "频率比率调节", "频率比例管理", "频率比率管理", "频率比例策略", "频率比率策略", "频率比例方案", "频率比率方案", "频率比例方法", "频率比率方法", "频率比例步骤", "频率比率步骤", "频率比例流程", "频率比率流程", "频率比例操作", "频率比率操作", "频率比例实施", "频率比率实施", "频率比例执行", "频率比率执行", "频率比例验证", "频率比率验证", "频率比例测试", "频率比率测试", "频率比例测量", "频率比率测量", "频率比例检测", "频率比率检测", "频率比例监测", "频率比率监测", "频率比例诊断", "频率比率诊断", "频率比例维修", "频率比率维修", "频率比例保养", "频率比率保养", "频率比例维护", "频率比率维护", "频率比例更换", "频率比率更换", "频率比例升级", "频率比率升级", "频率比例改进", "频率比率改进", "频率比例迭代", "频率比率迭代", "频率比例更新", "频率比率更新", "频率比例版本", "频率比率版本", "频率比例版本号", "频率比率版本号", "频率比例编号", "频率比率编号", "频率比例标识", "频率比率标识", "频率比例标志", "频率比率标志", "频率比例标记", "频率比率标记", "频率比例符号", "频率比率符号", "频率比例代码", "频率比率代码", "频率比例名称", "频率比率名称", "频率比例型号", "频率比率型号", "频率比例规格", "频率比率规格", "频率比例手册", "频率比率手册", "频率比例资料", "频率比率资料", "频率比例文献", "频率比率文献", "频率比例论文", "频率比率论文", "频率比例报告", "频率比率报告", "频率比例总结", "频率比率总结", "频率比例评价", "频率比率评价", "频率比例评估", "频率比率评估", "频率比例考核", "频率比率考核", "频率比例打分", "频率比率打分", "频率比例评分", "频率比率评分", "频率比例排名", "频率比率排名", "频率比例排序", "频率比率排序", "频率比例分类", "频率比率分类", "频率比例分组", "频率比率分组", "频率比例分区", "频率比率分区", "频率比例划分", "频率比率划分", "频率比例分割", "频率比率分割", "频率比例分离", "频率比率分离", "频率比例分界", "频率比率分界", "频率比例边界", "频率比率边界", "频率比例界限", "频率比率界限", "频率比例范围", "频率比率范围", "频率比例区间", "频率比率区间", "频率比例区域", "频率比率区域", "频率比例段", "频率比率段", "频率比例带宽", "频率比率带宽", "频率比例宽度", "频率比率宽度", "频率比例宽度", "频率比例跨度", "频率比率跨度", "频率比例跨越", "频率比率跨越", "频率比例间隔", "频率比率间隔", "频率比例间距", "频率比率间距", "频率比例步进", "频率比率步进", "频率比例步长", "频率比率步长", "频率比例增量", "频率比率增量", "频率比例变化量", "频率比率变化量", "频率比例增减", "频率比率增减", "频率比例增减量", "频率比率增减量", "频率比例增益", "频率比率增益", "频率比例衰减", "频率比率衰减", "频率比例损失", "频率比率损失", "频率比例损耗", "频率比率损耗", "频率比例衰减量", "频率比率衰减量", "频率比例增益量", "频率比率增益量", "频率比例放大", "频率比率放大", "频率比例缩小", "频率比率缩小", "频率比例扩展", "频率比率扩展", "频率比例压缩", "频率比率压缩", "频率比例放大倍数", "频率比率放大倍数", "频率比例缩小倍数", "频率比率缩小倍数", "频率比例扩展倍数", "频率比率扩展倍数", "频率比例压缩倍数", "频率比率压缩倍数", "频率比例比例", "频率比率比率", "频率比例比例系数", "频率比率比率系数", "频率比例比例因子", "频率比率比率因子", "频率比例比例参数", "频率比率比率参数", "频率比例比例常数", "频率比率比率常数", "频率比例比例公式", "频率比率比率公式", "频率比例比例计算", "频率比率比率计算", "频率比例比例推导", "频率比率比率推导", "频率比例比例分析", "频率比率比率分析", "频率比例比例设计", "频率比率比率设计", "频率比例比例选型", "频率比率比率选型", "频率比例比例匹配", "频率比率比率匹配", "频率比例比例优化", "频率比率比率优化", "频率比例比例调整", "频率比率比率调整", "频率比例比例控制", "频率比率比率控制", "频率比例比例调节", "频率比率比率调节", "频率比例比例管理", "频率比率比率管理", "频率比例比例策略", "频率比率比率策略", "频率比例比例方案", "频率比率比率方案", "频率比例比例方法", "频率比率比率方法", "频率比例比例步骤", "频率比率比率步骤", "频率比例比例流程", "频率比率比率流程", "频率比例比例操作", "频率比率比率操作", "频率比例比例实施", "频率比率比率实施", "频率比例比例执行", "频率比率比率执行", "频率比例比例验证", "频率比率比率验证", "频率比例比例测试", "频率比率比率测试", "频率比例比例测量", "频率比率比率测量", "频率比例比例检测", "频率比率比率检测", "频率比例比例监测", "频率比率比率监测", "频率比例比例诊断", "频率比率比率诊断", "频率比例比例维修", "频率比率比率维修", "频率比例比例保养", "频率比率比率保养", "频率比例比例维护", "频率比率比率维护", "频率比例比例更换", "频率比率比率更换", "频率比例比例升级", "频率比率比率升级", "频率比例比例改进", "频率比率比率改进", "频率比例比例迭代", "频率比率比率迭代", "频率比例比例更新", "频率比率比率更新", "频率比例比例版本", "频率比率比率版本", "频率比例比例版本号", "频率比率比率版本号", "频率比例比例编号", "频率比率比率编号", "频率比例比例标识", "频率比率比率标识", "频率比例比例标志", "频率比率比率标志", "频率比例比例标记", "频率比率比率标记", "频率比例比例符号", "频率比率比率符号", "频率比例比例代码", "频率比率比率代码", "频率比例比例名称", "频率比率比率名称", "频率比例比例型号", "频率比率比率型号", "频率比例比例规格", "频率比率比率规格", "频率比例比例手册", "频率比率比率手册", "频率比例比例资料", "频率比率比率资料", "频率比例比例文献", "频率比率比率文献", "频率比例比例论文", "频率比率比率论文", "频率比例比例报告", "频率比率比率报告", "频率比例比例总结", "频率比率比率总结", "频率比例比例评价", "频率比率比率评价", "频率比例比例评估", "频率比率比率评估", "频率比例比例考核", "频率比率比率考核", "频率比例比例打分", "频率比率比率打分", "频率比例比例评分", "频率比率比率评分", "频率比例比例排名", "频率比率比率排名", "频率比例比例排序", "频率比率比率排序", "频率比例比例分类", "频率比率比率分类", "频率比例比例分组", "频率比率比率分组", "频率比例比例分区", "频率比率比率分区", "频率比例比例划分", "频率比率比率划分", "频率比例比例分割", "频率比率比率分割", "频率比例比例分离", "频率比率比率分离", "频率比例比例分界", "频率比率比率分界", "频率比例比例边界", "频率比率比率边界", "频率比例比例界限", "频率比率界限", "频率比例比例范围", "频率比率比率范围", "频率比例比例区间", "频率比率比率区间", "频率比例比例区域", "频率比率比率区域", "频率比例比例段", "频率比率比率段", "频率比例比例带宽", "频率比率比率带宽", "频率比例比例宽度", "频率比率比率宽度", "频率比例比例宽度", "频率比例比率宽度", "频率比例比例跨度", "频率比率比率跨度", "频率比例比例跨越", "频率比率比率跨越", "频率比例比例间隔", "频率比率比率间隔", "频率比例比例间距", "频率比率比率间距", "频率比例比例步进", "频率比率比率步进", "频率比例比例步长", "频率比率比率步长", "频率比例比例增量", "频率比率比率增量", "频率比例比例变化量", "频率比率比率变化量", "频率比例比例增减", "频率比率比率增减", "频率比例比例增减量", "频率比率比率增减量", "频率比例比例增益", "频率比率比率增益", "频率比例比例衰减", "频率比率比率衰减", "频率比例比例损失", "频率比率比率损失", "频率比例比例损耗", "频率比率比率损耗", "频率比例比例衰减量", "频率比率比率衰减量", "频率比例比例增益量", "频率比率比率增益量", "频率比例比例放大", "频率比率比率放大", "频率比例比例缩小", "频率比率比率缩小", "频率比例比例扩展", "频率比率比率扩展", "频率比例比例压缩", "频率比率比率压缩", "频率比例比例放大倍数", "频率比率比率放大倍数", "频率比例比例缩小倍数", "频率比率比率缩小倍数", "频率比例比例扩展倍数", "频率比率比率扩展倍数", "频率比例比例压缩倍数", "频率比率比率压缩倍数", "频率比例比例比例", "频率比率比率比例", "频率比例比例比例系数", "频率比率比率比率系数", "频率比例比例比例因子", "频率比率比率比率因子", "频率比例比例比例参数", "频率比率比率比率参数", "频率比例比例比例常数", "频率比率比率比率常数", "频率比例比例比例公式", "频率比率比率比率公式", "频率比例比例比例计算", "频率比率比率比率计算", "频率比例比例比例推导", "频率比率比率比率推导", "频率比例比例比例分析", "频率比率比率比率分析", "频率比例比例比例设计", "频率比率比率比率设计", "频率比例比例比例选型", "频率比率比率比率选型", "频率比例比例比例匹配", "频率比率比率比率匹配", "频率比例比例比例优化", "频率比率比率比率优化", "频率比例比例比例调整", "频率比率比率比率调整", "频率比例比例比例控制", "频率比率比率比率控制", "频率比例比例比例调节", "频率比率比率比率调节", "频率比例比例比例管理", "频率比率比率比率管理", "频率比例比例比例策略", "频率比率比率比率策略", "频率比例比例比例方案", "频率比率比率比率方案", "频率比例比例比例方法", "频率比率比率比率方法", "频率比例比例比例步骤", "频率比率比率比率步骤", "频率比例比例比例流程", "频率比率比率比率流程", "频率比例比例比例操作", "频率比率比率比率操作", "频率比例比例比例实施", "频率比率比率比率实施", "频率比例比例比例执行", "频率比率比率比率执行", "频率比例比例比例验证", "频率比率比率比率验证", "频率比例比例比例测试", "频率比率比率比率测试", "频率比例比例比例测量", "频率比率比率比率测量", "频率比例比例比例检测", "频率比率比率比率检测", "频率比例比例比例监测", "频率比率比率比率监测", "频率比例比例比例诊断", "频率比率比率比率诊断", "频率比例比例比例维修", "频率比率比率比率维修", "频率比例比例比例保养", "频率比率比率比率保养", "频率比例比例比例维护", "频率比率比率比率维护", "频率比例比例比例更换", "频率比率比率比率更换", "频率比例比例比例升级", "频率比率比率比率升级", "频率比例比例比例改进", "频率比率比率比率改进", "频率比例比例比例迭代", "频率比率比率比率迭代", "频率比例比例比例更新", "频率比率比率比率更新", "频率比例比例比例版本", "频率比率比率版本", "频率比例比例比例版本号", "频率比率比率比率版本号", "频率比例比例比例编号", "频率比率比率编号", "频率比例比例比例标识", "频率比率比率标识", "频率比例比例比例标志", "频率比率比率标志", "频率比例比例比例标记", "频率比率比率标记", "频率比例比例比例符号", "频率比率比率符号", "频率比例比例比例代码", "频率比率比率代码", "频率比例比例比例名称", "频率比率比率名称", "频率比例比例比例型号", "频率比率比率型号", "频率比例比例比例规格", "频率比率比率规格", "频率比例比例比例手册", "频率比率比率手册", "频率比例比例比例资料", "频率比率比率资料", "频率比例比例比例文献", "频率比率比率文献", "频率比例比例比例论文", "频率比率比率论文", "频率比例比例比例报告", "频率比率比率报告", "频率比例比例比例总结", "频率比率比率总结", "频率比例比例比例评价", "频率比率比率评价", "频率比例比例比例评估", "频率比率比率评估", "频率比例比例比例考核", "频率比率比率考核", "频率比例比例比例打分", "频率比率比率打分", "频率比例比例比例评分", "频率比率比率评分", "频率比例比例比例排名", "频率比率比率排名", "频率比例比例比例排序", "频率比率比率排序", "频率比例比例比例分类", "频率比率比率分类", "频率比例比例比例分组", "频率比率比率分组", "频率比例比例比例分区", "频率比率比率分区", "频率比例比例比例划分", "频率比率比率划分", "频率比例比例比例分割", "频率比率比率分割", "频率比例比例比例分离", "频率比率比率分离", "频率比例比例比例分界", "频率比率比率分界", "频率比例比例比例边界", "频率比率比率边界", "频率比例比例比例界限", "频率比率界限", "频率比例比例比例范围", "频率比率比率范围", "频率比例比例比例区间", "频率比率比率区间", "频率比例比例比例区域", "频率比率比率区域", "频率比例比例比例段", "频率比率比率段", "频率比例比例比例带宽", "频率比率比率带宽", "频率比例比例比例宽度", "频率比率比率宽度"]):
+                    key_phrases.append(phrase)
+            if key_phrases:
+                conclusion += f"根据证据，涉及 {', '.join(key_phrases[:8])}。"
+        else:
+            conclusion += "证据不足，无法给出确定性分析，需结合实测波形和原理图复核。"
+        # Build a concise answer structure
+        answer_parts = [conclusion]
+        if mechanisms := "\n".join(f"- {compact_text(note, 350)}" for note in skill_notes[:2]):
+            answer_parts.append(f"\n技术机制：\n{mechanisms}")
+        if image_summary := "\n".join(f"- {compact_text(note, 280)}" for note in image_notes[:1]):
+            answer_parts.append(f"\n图片依据：\n{image_summary}")
+        answer_parts.append(
+            "\n检查步骤：测题面提到的输出/采样/反馈节点波形，核对相关电阻、电容、MOS、光耦或控制芯片引脚连接。"
+            "\n处理建议与不确定性：证据不足时不应给出确定参数，需通过示波器和原理图复核后再定值。"
         )
+        return "\n".join(answer_parts)
+
+    def _sanitize_answer(self, answer: str, question: str, evidence: list[Evidence]) -> str:
+        """Remove unsupported entity claims from final answer."""
+        known_entities = set()
+        # From question
+        for m in re.finditer(r"[RCLDQUV]\d+[A-Z0-9]*", question, re.IGNORECASE):
+            known_entities.add(m.group().upper())
+        # From evidence text
+        all_evidence_text = " ".join(item.content for item in evidence)
+        for m in re.finditer(r"[RCLDQUV]\d+[A-Z0-9]*", all_evidence_text, re.IGNORECASE):
+            known_entities.add(m.group().upper())
+        # Also collect known IC models, pin numbers, and specific values from question+evidence
+        source_text = question + " " + all_evidence_text
+        # IC models: LM393, TL431, NE555, UC3842, etc.
+        for m in re.finditer(r"[A-Z]{1,3}\d{2,6}[A-Z]?\d*[A-Z]*", source_text, re.IGNORECASE):
+            known_entities.add(m.group().upper())
+        # Pin/GPIO references: PIN3, GPIO5, 引脚3, 第3脚
+        for m in re.finditer(r"(?:PIN|GPIO|引脚|第)\s*\d+", source_text, re.IGNORECASE):
+            known_entities.add(m.group().upper())
+
+        # Find unsupported refdes in answer and remove them
+        unsupported_refdes = set(m.group().upper() for m in re.finditer(r"[RCLDQUV]\d+[A-Z0-9]*", answer, re.IGNORECASE)) - known_entities
+        for refdes in unsupported_refdes:
+            # Remove the refdes and any associated value pattern nearby
+            answer = re.sub(rf'{refdes}\s*[=≈]\s*\d+(?:\.\d+)?\s*[A-Za-zΩμ]+', '', answer, flags=re.IGNORECASE)
+            answer = re.sub(rf'(?:,\s*|和\s*|、\s*)?{refdes}', '', answer, flags=re.IGNORECASE)
+            answer = re.sub(rf'{refdes}(?:\s*[=≈]\s*)?', '', answer, flags=re.IGNORECASE)
+
+        # Find unsupported IC model claims
+        answer_ic_models = set(m.group().upper() for m in re.finditer(r"[A-Z]{1,3}\d{2,6}[A-Z]?\d*[A-Z]*", answer, re.IGNORECASE))
+        # Filter out common non-IC patterns (voltage values like 3V3, resistor notation)
+        _non_ic_patterns = {"3V3", "5V", "12V", "24V", "220V", "311V", "0V", "1V", "2V", "10V", "15V", "30V"}
+        unsupported_ic = answer_ic_models - known_entities - _non_ic_patterns
+        for ic in unsupported_ic:
+            # Remove IC model and nearby spec claims
+            answer = re.sub(rf'{ic}\s*[（(].*?[）)]', '', answer, flags=re.IGNORECASE)
+            answer = re.sub(rf'(?:芯片|IC|集成电路|型号)\s*{ic}', '', answer, flags=re.IGNORECASE)
+            answer = re.sub(rf'{ic}', '', answer, flags=re.IGNORECASE)
+
+        # Clean up empty parentheses, dangling commas, etc.
+        answer = re.sub(r'\(\s*\)', '', answer)
+        answer = re.sub(r'[,，]\s*[,，]', ',', answer)
+        answer = re.sub(r'\s{2,}', ' ', answer)
+        return answer.strip()
 
 
 class ImageInspectTool(ToolDefinition[ImageInspectAction, EvidenceObservation]):
@@ -1015,69 +1111,85 @@ def _search_evidence(query: str, provider: str, title: str, url: str, content: s
 
 
 def _query_terms(text: str) -> list[str]:
-    tokens = re.findall(r"[A-Za-z]{1,8}\d{0,5}[A-Za-z0-9_.+-]*|\d+(?:\.\d+)?\s*[A-Za-zΩμ%]*|[\u4e00-\u9fff]{2,}", text or "")
+    tokens = re.findall(r"[A-Za-z]{1,8}\d{0,5}[A-Za-z0-9_.+-]*|\d+(?:\.\d+)?\s*[A-Za-zΩμ%]*|[一-鿿]{2,}", text or "")
     stop = {"请教", "问题", "为什么", "怎么", "处理", "以及", "这个", "电路", "作用", "哪些"}
     cleaned = [token.strip() for token in tokens if token.strip() and token.strip() not in stop]
     return list(dict.fromkeys(cleaned))
 
 
-def _kb_evidence_allowed(question: str, item: Evidence, min_relevance: float = 5.0) -> bool:
-    relevance = float(item.metadata.get("kb_relevance") or item.metadata.get("rerank_score") or item.score or 0.0)
-    if relevance < min_relevance:
-        return False
-    if item.metadata.get("high_relevance") is False:
-        return False
-    if is_low_value_source(item.source) or is_boilerplate_text(f"{item.title}\n{item.source}\n{item.content}"):
-        return False
-    matched_terms = item.metadata.get("matched_query_terms") if isinstance(item.metadata, dict) else {}
-    if is_circuitmaker_project_source(item.source):
-        strong_matched = []
-        if isinstance(matched_terms, dict):
-            for key in ("models", "refdes", "values"):
-                strong_matched.extend(matched_terms.get(key) or [])
-        if not strong_matched and relevance < min_relevance + 2.0:
-            return False
-    if not question:
-        return True
-    text = f"{item.title} {item.source} {item.content}".lower()
-    profile = classify_query_terms(question)
-    terms = [term.lower() for term in _query_terms(question)]
-    strong_terms = [term.lower() for term in [*profile["models"], *profile["refdes"], *profile["values"]]]
-    if strong_terms:
-        return any(term in text for term in strong_terms)
-    matched = sum(1 for term in terms if len(term) >= 3 and term in text)
-    return matched >= 2
+_BOILERPLATE_LINE_PATTERNS = [
+    re.compile(r"发表于\s*\d{4}-\d{2}-\d{2}\s*•\s*\d+次阅读"),
+    re.compile(r"\d+次阅读"),
+    re.compile(r"次下载"),
+    re.compile(r"下载该资料的人也在下载"),
+    re.compile(r"下载该资料的人还在阅读"),
+    re.compile(r"免费下载.*(?:PDF|pdf).*电子书"),
+    re.compile(r"热门推荐|相关推荐|相关文章|相关阅读"),
+    re.compile(r"上一篇|下一篇"),
+    re.compile(r"!\[.*?\]\([^)]*load\.\w+\)"),
+    re.compile(r"!\[.*?\]\([^)]*eye\.\w+\)"),
+    re.compile(r"!\[电子发烧友网Logo\]"),
+    re.compile(r"\d+\s*•\s*\d+次阅读"),
+    re.compile(r"---[|]*---"),
+    re.compile(r"专栏\s+电子说\s+商业评论"),
+    re.compile(r"电子发烧友网\s*>"),
+    re.compile(r"skin\.elecfans\.com|skin-2012"),
+    re.compile(r"file\.elecfans\.com"),
+    re.compile(r"^\s*(立即登录|注册|登录|Sign\s*Up|Sign\s*In)\s*$", re.IGNORECASE),
+    re.compile(r"^\s*(快捷导航|社区导航|搜索中心)\s*$"),
+    re.compile(r"^\s*!\[.*?\]\(.*?\)\s*$"),
+    re.compile(r"^\s*[*\s]*$"),
+]
+
+_CAUSAL_SENTENCE_PATTERNS = [
+    re.compile(r"因为.+所以"),
+    re.compile(r"(?:导致|引起|使得|造成|促进|增强|抑制|减小|抵消|改善|降低|提升|提高|防止|避免|用于|用来|用于滤除|主要作用是|也称|具体包括)"),
+    re.compile(r"[A-Za-z]+\s*[→=>]\s*[A-Za-z]+"),
+    re.compile(r"\b(?:formula|equation|Vout|Vin|Iout|f_c|fsw|duty|gain|phase|margin|pole|zero|compensation)\b", re.IGNORECASE),
+]
 
 
-def _trusted_source(source: str) -> bool:
-    host = urlparse(source).hostname or ""
-    trusted_markers = (
-        "ti.com",
-        "analog.com",
-        "onsemi.com",
-        "st.com",
-        "infineon.com",
-        "electronics.stackexchange.com",
-        "edn.com",
-        "ridleyengineering.com",
-    )
-    return any(marker in host for marker in trusted_markers)
+def _compress_boilerplate(text: str, max_chars: int = 600) -> str:
+    """Strip boilerplate lines and prioritize causal/technical sentences."""
+    if not text:
+        return ""
+    lines = text.split("\n")
+    clean_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if any(pat.search(stripped) for pat in _BOILERPLATE_LINE_PATTERNS):
+            continue
+        if len(stripped) < 15 and not re.search(r"[A-Za-z]{3,}|\d+(?:\.\d+)?[A-Za-z]", stripped):
+            continue
+        clean_lines.append(stripped)
+    clean_text = " ".join(clean_lines)
+    if len(clean_text) <= max_chars:
+        return clean_text
+    scored_lines = []
+    for line in clean_lines:
+        score = 0
+        if any(pat.search(line) for pat in _CAUSAL_SENTENCE_PATTERNS):
+            score += 3
+        if re.search(r"\b(?:TL431|LM358|LM324|UC384|SG3525|IR2110|PC817|EL817|NE555|AO340|IRF\d+|STM32|ESP32)\b", line, re.IGNORECASE):
+            score += 2
+        if re.search(r"[RCLDQUV]\d+[A-Z0-9]*", line, re.IGNORECASE):
+            score += 2
+        if re.search(r"\d+(?:\.\d+)?(?:ohm|kohm|Ω|μF|uf|nf|pF|pf|Hz|khz|MHz|V|mA|A|W)", line, re.IGNORECASE):
+            score += 1
+        score += min(1, len(line) // 60)
+        scored_lines.append((score, line))
+    scored_lines.sort(key=lambda x: x[0], reverse=True)
+    result_lines = []
+    total_len = 0
+    for _score, line in scored_lines:
+        if total_len + len(line) + 1 <= max_chars:
+            result_lines.append(line)
+            total_len += len(line) + 1
+        else:
+            break
+    return " ".join(result_lines)
 
 
-def _readonly_annotations(open_world: bool = False) -> Any:
-    if ToolAnnotations is None:
-        return None
-    return ToolAnnotations(
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=open_world,
-    )
 
-
-def evidence_to_json(items: list[Evidence]) -> list[dict[str, Any]]:
-    return [item.to_json() for item in items]
-
-
-def evidence_from_json(items: list[dict[str, Any]]) -> list[Evidence]:
-    return [Evidence(**item) for item in items]

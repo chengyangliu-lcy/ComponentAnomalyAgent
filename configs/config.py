@@ -64,6 +64,8 @@ class RuntimeConfig:
         direct_key = self.raw["model"].get("api_key")
         if direct_key:
             return str(direct_key)
+        if self.provider == "vllm":
+            return "no-key"
         env_name = self.raw["model"].get("api_key_env", "DASHSCOPE_API_KEY")
         return os.environ.get(env_name)
 
@@ -86,6 +88,30 @@ class RuntimeConfig:
     def judge_model(self) -> str:
         env_name = self.raw["model"].get("judge_model_env", "JUDGE_MODEL")
         return os.environ.get(env_name) or self.raw["model"]["default_judge_model"]
+
+    @property
+    def provider(self) -> str:
+        return self.raw["model"].get("provider", "dashscope")
+
+    def _extra_body(self, key: str) -> dict[str, Any]:
+        raw = self.raw["model"].get(key, {})
+        if not raw:
+            return {}
+        if self.provider == "vllm":
+            return {"chat_template_kwargs": dict(raw)}
+        return dict(raw)
+
+    @property
+    def planner_extra_body(self) -> dict[str, Any]:
+        return self._extra_body("planner_extra_body")
+
+    @property
+    def vision_extra_body(self) -> dict[str, Any]:
+        return self._extra_body("vision_extra_body")
+
+    @property
+    def answer_extra_body(self) -> dict[str, Any]:
+        return self._extra_body("answer_extra_body")
 
     def ensure_dirs(self) -> None:
         self.outputs_dir.mkdir(parents=True, exist_ok=True)
