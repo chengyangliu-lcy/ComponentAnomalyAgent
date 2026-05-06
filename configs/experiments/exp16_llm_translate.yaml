@@ -1,0 +1,24 @@
+# Exp16: Improved KB (v3) + LLM Query Translation + Structured Answer Template
+# Same as Exp15 but with LLM-based query translation (code now reads the flag)
+# Cross-encoder disabled to isolate translation impact
+# Compare vs exp15 (dictionary translation, 0.5680) and exp14 (no KB, 0.5724)
+
+paths:
+  local_kb_index: knowledge_base/circuit_diagnosis_fts_hq_v3
+
+agent:
+  enable_local_retrieval: true
+  max_local_retrieval_calls: 3
+  max_local_docs: 4
+  max_local_chunks: 6
+  enable_web_search: true
+  web_search_mode: auto
+
+retrieval:
+  embedding_model: 'Qwen/Qwen3-Embedding-4B'
+  dense_weight: 0.65
+  sparse_weight: 0.35
+  device: cuda
+  embedding_batch_size: 64
+  enable_llm_query_rewriting: true
+  enable_cross_encoder_rerank: false

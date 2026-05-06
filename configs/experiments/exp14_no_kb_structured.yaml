@@ -1,0 +1,28 @@
+# Exp 14: No KB + Structured Answer Template
+# Same as Exp13 but with local_retrieval disabled
+# Goal: isolate structured template effect without KB
+# Compare vs Exp12 (no KB, flexible template) to measure template impact
+
+paths:
+  local_kb_index: knowledge_base/circuit_diagnosis_fts_hq_v2
+
+agent:
+  enable_local_retrieval: false
+  max_local_retrieval_calls: 0
+  max_local_docs: 0
+  max_local_chunks: 0
+  enable_web_search: true
+  web_search_mode: auto
+
+retrieval:
+  embedding_model: 'Qwen/Qwen3-Embedding-4B'
+  dense_weight: 0.65
+  sparse_weight: 0.35
+  device: cuda
+  embedding_batch_size: 64
+  enable_llm_query_rewriting: false
+  enable_cross_encoder_rerank: false
+  hybrid_score_threshold: 0.15
+  high_relevance_threshold: 0.4
+  max_chunks_per_url: 2
+  enable_contextual_retrieval: false

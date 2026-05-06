@@ -5,6 +5,7 @@ import json
 import re
 import sqlite3
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +42,7 @@ PUBLIC_TECH_ALLOWED_PATHS = {
         "/eda/",
         "/soft/",
         "/yuanqijian/",
+        "/news/",
     ),
     "elecfans.com": (
         "/article/",
@@ -51,6 +53,7 @@ PUBLIC_TECH_ALLOWED_PATHS = {
         "/eda/",
         "/soft/",
         "/yuanqijian/",
+        "/news/",
     ),
     "www.electronicsforu.com": (
         "/electronics-projects/",
@@ -64,20 +67,24 @@ PUBLIC_TECH_ALLOWED_PATHS = {
         "/design-guides/",
         "/resources/",
     ),
-    "radiokot.ru": (
-        "/articles/",
-        "/circuit/",
+    "www.eet-china.com": (
+        "/news/",
+        "/article/",
     ),
-    "radiokot.ru:81": (
-        "/articles/",
-        "/circuit/",
+    "eet-china.com": (
+        "/news/",
+        "/article/",
+    ),
+    "mbb.eet-china.com": (
+        "/blog/",
     ),
 }
 
 PUBLIC_TECH_REJECT_PATH_PARTS = (
     "/tag/",
+    "/tags/",
     "/category/",
-    "/news/",
+    "/categories/",
     "/company/",
     "/market",
     "/forum/",
@@ -88,7 +95,31 @@ PUBLIC_TECH_REJECT_PATH_PARTS = (
     "/contest",
     "/products/",
     "/download/",
-    "/soft/study/",
+    "/downloads/",
+    "/soft/",
+    "/page/",
+    "/search/",
+    "/author/",
+    "/baike/",
+    "/d/user/",
+    "/video/",
+    "/yuanqijian/",
+    "/dianlutu/",
+    "/resource/",
+    "/ace/",
+    "/home/",
+    "/forum",
+)
+
+PUBLIC_TECH_REJECT_PATH_SUBSTRINGS = (
+    "/article_",  # pagination like /Article_795_3.html
+)
+
+# Pagination URLs and bare directory listings
+_PUBLIC_TECH_REJECT_PATH_REGEX = re.compile(
+    r'/[^/]+/\d+_\d+\.html$'  # /connector/996_5.html style pagination
+    r'|/[^/]+/[^/]+/$'         # /yuanqijian/diangangqi/ style category dirs
+    r'|/[^/]+/$'               # /connector/ style bare dirs
 )
 
 PUBLIC_TECH_REJECT_TITLES = (
@@ -97,8 +128,13 @@ PUBLIC_TECH_REJECT_TITLES = (
     "301 moved permanently",
     "object moved",
     "提示信息",
+    "信息提示",
     "subscription corner",
     "archives |",
+    "composite archives",
+    "electronics news |",
+    "无标题",
+    " redirecting to ",
 )
 
 BOILERPLATE_LINE_MARKERS = (
@@ -145,6 +181,39 @@ PUBLIC_TECH_SECTION_STOP_MARKERS = (
     "创新实用技术专题",
 )
 
+# English/Russian section-stop markers (case-insensitive match)
+EN_SECTION_STOP_MARKERS = (
+    "related articles",
+    "more stories",
+    "categories",
+    "what's new @",
+    "what's new",
+    "most popular diys",
+    "most popular",
+    "electronics components",
+    "design guides",
+    "truly innovative tech",
+    "recent forum discussions",
+    "share your thoughts & comments",
+    "share your thoughts",
+    "cancel reply",
+    "previous article",
+    "next article",
+    "network consists of further focused websites",
+    "inspired by our flagship publication",
+    "checked out efy express",
+    "electronics news",
+    "most popular videos",
+    "calculators",
+    "comments",
+    "editor version",
+    "similar projects",
+    "эти статьи вам тоже могут пригодиться",
+    "все вопросы в форум",
+    "как вам эта статья",
+    "работоспособность сайта проверена в браузерах",
+)
+
 PUBLIC_TECH_PREARTICLE_MARKERS = (
     "编辑推荐",
     "推荐帖子",
@@ -159,6 +228,146 @@ PUBLIC_TECH_PREARTICLE_MARKERS = (
     "文章:新闻",
     "下载:eda",
     "栏目导航",
+)
+
+# Extended Chinese post-content markers that should stop article body
+ZH_POST_CONTENT_MARKERS = (
+    "技术专区",
+    "相关帖子",
+    "相关标签",
+    "关注此标签的用户",
+    "相关推荐",
+    "相关评论",
+    "可能感兴趣",
+    "关注本资料的网友",
+    "编辑推荐厂商产品技术软件",
+    "华强聚丰",
+    "my elecfans",
+    "产业",
+    "特色栏目",
+    "社群",
+    "供应链服务",
+    "媒体服务",
+    "关于本站",
+    "欢迎投稿",
+    "用户建议",
+    "版权申明",
+    "友情链接",
+    "下载排行榜",
+    "最新精华",
+    "原创博文",
+    "ee直播间",
+    "在线研讨会",
+    "最新资讯",
+    "热门推荐",
+    "热门资料",
+    "推荐白皮书",
+    "新帖速递",
+    "随便看看",
+    "热门标签",
+    "最新文章",
+    "热门资料推荐",
+    "开源项目",
+    "查找数据手册",
+    "站长推荐",
+    "阅读更多内容",
+    "本网页已闲置",
+    "扫码关注",
+    "声明：",
+    "本文转载自",
+    "热门词",
+    "创新实用技术专题",
+    "论坛热帖",
+    "活动中心",
+    "快速回复",
+    "返回顶部",
+    "面包版社区版主招募",
+    "有奖互动",
+    "上传资料得京东卡",
+    "查看他发布的资源",
+    "上传用户",
+    "下载次数",
+    "所需E币",
+    "立即下载",
+    "资料介绍",
+    "推荐星级",
+    "原文链接：",
+    "原文出处：",
+    "文章来源：",
+    "本文来源：",
+    "原文地址：",
+    "分享到：",
+    "微信 qq空间",
+    "新浪微博 腾讯微博",
+    "收藏(0)",
+    "打印",
+    "pcbway",
+)
+
+# Inline noise lines to filter out (case-insensitive)
+INLINE_NOISE_MARKERS = (
+    "- advertisement -",
+    "telegram",
+    "whatsapp",
+    "watch this video on youtube",
+    "log in to leave a comment",
+    "please enter your comment",
+    "please enter your name here",
+    "you have entered an incorrect email address",
+    "please enter your email address here",
+    "save my name, email, and website",
+    "登录阅读全文",
+    "您需要登录后才可以回帖",
+    "回复 分享 举报",
+    "返回列表 发新帖 回复",
+    "发新帖 回复",
+    "查看更多>>",
+    "add the following snippet to your html",
+    "html code here",
+    "replace this with any non empty raw html code",
+    "sign in",
+    "log in",
+    "sign up",
+    "sign in / join",
+    "register",
+    "welcome! log into your account",
+    "welcome! register for an account",
+    "forgot your password",
+    "create an account",
+    "password recovery",
+    "recover your password",
+    "a password will be e-mailed to you",
+    "your username",
+    "your password",
+    "your email",
+    "资料大小：",
+    "所需积分：",
+    "推荐星级：",
+    "类别：",
+    "阅读数：",
+    "上传者：",
+    "面包板社区",
+    "阅读更多内容，狠戳这里",
+    "本网页已闲置",
+    "扫码关注",
+    "面包芯语",
+    "微信扫码支付",
+    "余额支付",
+    "给作者打赏",
+    "站点导航",
+    "全球网站",
+    "关注我们",
+    "免费订阅杂志",
+    "电子工程专辑",
+    "国际电子商情",
+    "电子技术设计",
+    "e media asia ltd",
+    "粤icp备",
+    "面包版社区版主招募",
+    "上传资料得京东卡",
+    "有奖互动",
+    "看视频学模拟",
+    "推荐白皮书",
 )
 
 PUBLIC_TECH_CONTENT_TERMS = (
@@ -701,7 +910,7 @@ def is_public_tech_kb_page(page: CircuitMarkdownPage, min_chars: int = DEFAULT_M
     if not is_useful_page(page, min_chars):
         return False
     cleaned = clean_public_tech_text(page.text)
-    if len(cleaned) < min_chars:
+    if not _validate_cleaned_text(cleaned, title, url, min_chars):
         return False
     lowered = f"{page.title}\n{cleaned}".lower()
     technical_hits = sum(1 for term in ELECTRONIC_TERMS if term.lower() in lowered)
@@ -711,41 +920,111 @@ def is_public_tech_kb_page(page: CircuitMarkdownPage, min_chars: int = DEFAULT_M
 
 
 def is_public_tech_source_allowed(title: str, url: str) -> bool:
-    title = (title or "").strip().lower()
-    parsed = urlparse(url)
-    host = parsed.netloc.lower()
-    path = parsed.path.lower()
-    if not host or host not in PUBLIC_TECH_ALLOWED_PATHS:
+    """Lightweight pre-filter: reject junk titles and noise URL paths."""
+    title_lower = (title or "").strip().lower()
+    if not title_lower:
         return False
-    if any(marker in title for marker in PUBLIC_TECH_REJECT_TITLES):
-        return False
-    if any(part in path for part in PUBLIC_TECH_REJECT_PATH_PARTS):
-        return False
-    if not any(path.startswith(prefix) or prefix in path for prefix in PUBLIC_TECH_ALLOWED_PATHS[host]):
-        return False
-    if host.endswith("elecfans.com") and not path.endswith(".html"):
+    if any(marker in title_lower for marker in PUBLIC_TECH_REJECT_TITLES):
         return False
     if "�" in title:
+        return False
+    url_lower = (url or "").strip().lower()
+    if any(marker in url_lower for marker in PUBLIC_TECH_REJECT_PATH_PARTS):
+        return False
+    if any(sub in url_lower for sub in PUBLIC_TECH_REJECT_PATH_SUBSTRINGS):
+        return False
+    if _PUBLIC_TECH_REJECT_PATH_REGEX.search(url_lower):
         return False
     return True
 
 
+def _strip_trailing_numbered_section(text: str) -> str:
+    """Remove trailing numbered index / tag / related-articles sections.
+
+    These sections are post-content noise consisting of consecutive lines
+    starting with numbered items (e.g. "1. 汽车电子", "2. Silicon Labs")
+    mixed with related article titles, appearing at the very end of the text.
+
+    Strategy: scan backwards, when we find a cluster of 3+ numbered-item lines
+    within a short window (~10 lines from end), truncate at the boundary.
+    """
+    lines = text.split("\n")
+    n = len(lines)
+    if n < 3:
+        return text
+
+    # Scan last 15 lines (max) for a numbered-item cluster
+    window = min(15, n)
+    numbered_positions: list[int] = []
+    for i in range(n - window, n):
+        stripped = lines[i].strip()
+        if re.match(r"^\d+\.\s+\S", stripped) and len(stripped) < 100:
+            numbered_positions.append(i)
+
+    if len(numbered_positions) < 3:
+        return text
+
+    # Find the start of this numbered section: first numbered line that
+    # begins the cluster (looking for a gap of >2 non-numbered lines)
+    cluster_start = numbered_positions[0]
+    for j in range(1, len(numbered_positions)):
+        if numbered_positions[j] - numbered_positions[j - 1] > 3:
+            cluster_start = numbered_positions[j]
+
+    # Walk backwards from cluster_start to find section boundary
+    # Stop at a blank line, or a line ending with sentence punctuation
+    cut = cluster_start
+    for i in range(cluster_start - 1, max(0, cluster_start - 6), -1):
+        stripped = lines[i].strip()
+        if not stripped:
+            cut = i
+            break
+        if re.search(r"[。！？.!?]$", stripped) and len(stripped) > 40:
+            cut = i + 1
+            break
+        # If this line also looks like a numbered item, extend cut
+        if re.match(r"^\d+\.\s+\S", stripped) and len(stripped) < 100:
+            cut = i
+        else:
+            # Non-numbered short line between numbered items (article title)
+            # This is part of the related-articles section
+            cut = i
+
+    if cut <= n - 3:
+        return "\n".join(lines[:cut]).strip()
+    return text
+
+
 def clean_public_tech_text(text: str) -> str:
-    article_started = False
+    """Clean raw markdown from public electronics sites by removing noise.
+
+    Strategy:
+    1. Find the article body start (heading or continuous prose)
+    2. Keep lines until a section-stop marker is hit
+    3. Filter inline noise lines throughout
+    """
+    lines = [(i, line.strip()) for i, line in enumerate((text or "").splitlines()) if line.strip()]
+    if not lines:
+        return ""
+
+    article_start = _find_article_start_line_index(lines)
+
     kept: list[str] = []
-    for raw_line in (text or "").splitlines():
-        line = raw_line.strip()
-        if not line:
+    for idx, (orig_idx, line) in enumerate(lines):
+        if idx < article_start:
             continue
         lowered = line.lower()
-        if _is_public_tech_article_heading(line):
-            article_started = True
-        elif not article_started and any(marker in line for marker in ("技术资料介绍", "资料介绍")):
-            article_started = True
-            continue
-        if article_started and any(marker.lower() in lowered for marker in PUBLIC_TECH_SECTION_STOP_MARKERS):
+
+        # Check for section-stop markers (Chinese + English + Russian)
+        if any(marker.lower() in lowered for marker in PUBLIC_TECH_SECTION_STOP_MARKERS):
             break
-        if not article_started:
+        if any(marker in lowered for marker in EN_SECTION_STOP_MARKERS):
+            break
+        if any(marker in line for marker in ZH_POST_CONTENT_MARKERS):
+            break
+
+        # Filter inline noise
+        if _is_noise_line(line):
             continue
         if any(marker in lowered for marker in BOILERPLATE_LINE_MARKERS):
             continue
@@ -753,14 +1032,184 @@ def clean_public_tech_text(text: str) -> str:
             continue
         if _is_public_tech_navigation_line(line):
             continue
-        if line.startswith("!") or lowered.startswith("!["):
+        if any(marker in lowered for marker in INLINE_NOISE_MARKERS):
             continue
-        if len(line) < 8 and not any(char.isdigit() for char in line):
+
+        # Strip EETC watermark artifacts from line end (e.g. "text.ygxEETC-" or "text RCLEETC-")
+        line = re.sub(r"\.?\s*[a-zA-Z0-9]{2,8}EETC-\s*$", "", line)
+        # Strip inline image markdown from within text: "text ![alt](url) more text" -> "text  more text"
+        line = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", line)
+        # Strip inline reference/source notations: "（source：XXX）", "(参考原文：XXX)", etc.
+        line = re.sub(r"[（(]\s*(source|参考原文|编译自|文章来源)[：:]\s*[^)）]*[）)]", "", line, flags=re.IGNORECASE)
+        line = re.sub(r"\s*[（(]\s*(source|参考原文|编译自)[：:]\s*[^)）]*[）)]", "", line, flags=re.IGNORECASE)
+        # Strip article metadata fields: "时间：XXXX-XX-XX", "作者：XXX", "来源：XXX", "阅读：123"
+        line = re.sub(r"时间：[0-9\-]+\s*", "", line)
+        line = re.sub(r"作者：[^\s]+", "", line)
+        line = re.sub(r"来源：\S+", "", line)
+        line = re.sub(r"阅读：\d*\s*", "", line)
+        # Strip social share bar: "分享到：  ", "微信 QQ空间 新浪微博..."
+        line = re.sub(r"分享到：[\s]+", "", line)
+        line = re.sub(r"\b(微信|QQ空间|新浪微博|腾讯微博|人人网)\b", "", line)
+        # Strip user stats: "文章：2369 被阅读：11333997 粉丝数：61 关注数：18 点赞数：266"
+        line = re.sub(r"文章：\d+\s*", "", line)
+        line = re.sub(r"被阅读：\d+\s*", "", line)
+        line = re.sub(r"粉丝数：\d+\s*", "", line)
+        line = re.sub(r"关注数：\d+\s*", "", line)
+        line = re.sub(r"点赞数：\d+\s*", "", line)
+        line = re.sub(r"次阅读\s*", "", line)
+        # Strip action buttons: "0 收藏(0) 打印", "收藏 举报"
+        line = re.sub(r"\d*\s*收藏\s*[（(]\d*[）)]?\s*", "", line)
+        line = re.sub(r"\b打印\b", "", line)
+        line = re.sub(r"\b举报\b", "", line)
+        # After stripping, drop lines that are only noise characters
+        if re.fullmatch(r"[_\*\[\]\s\-\.\|/]*", line):
             continue
+        if not line.strip():
+            continue
+
         kept.append(line)
+
     cleaned = "\n".join(kept)
+    # Remove multi-line broken image markdown (alt text or URL spanning lines)
+    cleaned = re.sub(r"!\[[^\]]*?\]\s*\([^)]*?\)", "", cleaned, flags=re.DOTALL)
+    # Remove broken markdown link fragments: "text](url)" on its own line (missing "![")
+    cleaned = re.sub(r"^\s*[^\s!]+\]\([^)]*\.(png|jpg|jpeg|gif|bmp|svg)\)\s*$", "", cleaned, flags=re.MULTILINE)
+    # Remove orphaned image URL fragments (lines that are only a partial URL path)
+    cleaned = re.sub(r"\n_?//[^\s]+\n", "\n", cleaned)
+    # Strip trailing numbered index / related-articles section (keyword-agnostic)
+    cleaned = _strip_trailing_numbered_section(cleaned)
+    # Strip trailing keyword-tag line: "处理器/DSP 可穿戴设备 消费电子 市场分析"
+    # Characteristic: short space/slash-separated nouns, no verbs, no punctuation
+    lines = cleaned.split("\n")
+    if lines:
+        last = lines[-1].strip()
+        segments = re.split(r"[\s/]+", last)
+        if (len(segments) >= 3
+                and all(2 <= len(s) <= 20 for s in segments)
+                and not re.search(r"[。！？.!?，,：:]", last)
+                and len(last) < 120):
+            lines = lines[:-1]
+            cleaned = "\n".join(lines).strip()
+    # Remove broken URL fragments
+    cleaned = re.sub(r"^\s*\w+\.(com|cn|org|net|ru)/\S+\)?\s*$", "", cleaned, flags=re.MULTILINE)
+    # Remove PCBWay ad lines
+    cleaned = re.sub(r"^\s*PCBWay\s*[–\-—].*$", "", cleaned, flags=re.MULTILINE | re.IGNORECASE)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned
+
+
+def _find_article_start_line_index(lines: list[tuple[int, str]]) -> int:
+    """Find the line index where the article body begins.
+
+    Strategy (in priority order):
+    1. First # or ## heading that is not a noise heading
+    2. First occurrence of 3+ consecutive prose lines (>=40 chars, >50% alnum/CJK)
+    """
+    # Strategy 1: clean heading
+    noise_heading_words = (
+        "404", "301", "page not found", "object moved", "categories",
+        "what's new", "most popular", "electronics components", "design guides",
+        "truly innovative", "calculators", "技术专区", "相关推荐", "热门推荐",
+        "logo", "电子发烧友网logo", "electronics for you",
+        "技术", "应用市场", "产业", "特色栏目", "社群", "媒体服务", "供应链服务",
+    )
+    for idx, (orig_idx, line) in enumerate(lines):
+        heading_match = re.match(r"^(#{1,2})\s+(.+)$", line)
+        if heading_match:
+            heading_text = heading_match.group(2).strip().lower()
+            if len(heading_text) >= 6 and not any(w in heading_text for w in noise_heading_words):
+                return idx
+
+    # Strategy 2: consecutive prose lines
+    consecutive = 0
+    for idx, (orig_idx, line) in enumerate(lines):
+        if _is_noise_line(line):
+            consecutive = 0
+            continue
+        alnum_or_cjk = sum(c.isalnum() or "一" <= c <= "鿿" for c in line)
+        if len(line) >= 40 and alnum_or_cjk / max(len(line), 1) > 0.5:
+            consecutive += 1
+            if consecutive >= 3:
+                return idx - 2
+        else:
+            consecutive = 0
+
+    return 0
+
+
+def _is_noise_line(line: str) -> bool:
+    """Check if a single line is noise that should be filtered out."""
+    stripped = line.strip()
+    lowered = stripped.lower()
+    if not lowered:
+        return True
+    # Pure symbol lines
+    if re.fullmatch(r"[_\-*=#~\.\s│\|＋]+", stripped):
+        return True
+    # Image-only lines (no text description) — http, https, and protocol-relative URLs
+    if re.match(r"^_*!\[.*\]\(https?://[^\)]+\)$", stripped) and len(stripped) < 300:
+        return True
+    if re.match(r"^_*!\[.*\]\(//[^\)]+\)$", stripped) and len(stripped) < 300:
+        return True
+    # Lines that are just an image markdown with filename-only alt text
+    if re.match(r"^_*!\[[\w.-]+\.(png|jpg|jpeg|gif|bmp|svg)\]\([^)]+\)$", stripped):
+        return True
+    # Base64 data URL lines
+    if "data:image" in lowered and ("base64" in lowered):
+        return True
+    # Short navigation items
+    if lowered in ("home", "forums", "help", "search", "about us", "contact us",
+                   "projects (diy)", "explore", "specials", "channels", "what's new",
+                   "jobs & careers", "login", "register", "about us", "subscribe",
+                   "editor version", "share project", "recent searches",
+                   "activity", "article", "post", "profile", "friends", "team",
+                   "following", "followers", "documents", "bonsai", "bom",
+                   "главная", "схемы", "лаборатория", "статьи", "обучалка", "ссылки",
+                   "справочник", "о проекте", "форум", "首页", "论坛", "下载", "博客",
+                   "评测", "视频", "技术", "资源", "厂商", "电子论坛", "电子说", "学院",
+                   "芯城", "pcb", "smt", "最新更新", "专栏", "社区首页",
+                   "面包板社区", "面包芯语", "电子工程专辑",
+                   "国际电子商情", "电子技术设计",
+                   "在线研讨会", "技术白皮书",
+                   "厂商社区", "技术小站",
+                   "社区活动", "厂商活动"):
+        return True
+    # User stats / metadata lines
+    if re.match(r"^\d{1,3}\s*(次阅读|views|comments|shares|likes|浏览|回复)\b", lowered):
+        return True
+    if re.match(r"^(posted|published|updated)\s+(on\s+)?[\w\s,]+\d{4}", lowered):
+        return True
+    # Email-only line
+    if re.match(r"^\[email protected\]$", lowered.replace(" ", "")):
+        return True
+    # Short lines that are clearly navigation
+    if len(stripped) < 8 and not any(c.isdigit() for c in stripped):
+        return True
+    # Cookie / privacy / copyright links
+    if re.match(r"^(privacy policy|cookie policy|terms of use|terms of service)$", lowered):
+        return True
+    if re.match(r"^©\s*copyright", lowered):
+        return True
+    # Pure numbers (view counts, IDs)
+    if re.match(r"^_{1,2}\d+_{0,2}$", stripped):
+        return True
+    if re.match(r"^\d+$", stripped) and len(stripped) <= 6:
+        return True
+    # Standalone social media handles
+    if lowered in ("facebook", "linkedin", "twitter", "instagram", "telegram",
+                   "whatsapp", "email", "print", "youtube", "vimeo"):
+        return True
+    # Bare CDN image filenames (no markdown image syntax, just a path/filename)
+    if re.match(r"^[A-Z]{2,4}-[a-f0-9]{20,}\.(png|jpg|jpeg|gif)\)?$", stripped):
+        return True
+    # Lines that are only CDN URL paths
+    if re.match(r"^https?://[^/]+/.+\.(png|jpg|jpeg|gif|bmp|svg)\)?$", lowered) and len(stripped) < 120:
+        return True
+    # Bare protocol-relative image URLs
+    if re.match(r"^//[^/]+/.+\.(png|jpg|jpeg|gif|bmp|svg)\)?$", lowered) and len(stripped) < 120:
+        return True
+    return False
+
 
 
 def _is_public_tech_article_heading(line: str) -> bool:
@@ -778,7 +1227,26 @@ def _is_public_tech_navigation_line(line: str) -> bool:
         return True
     if lowered.startswith("!["):
         return True
+    if re.match(r"^__+\s*(telegram|facebook|linkedin|whatsapp|email|print|twitter|youtube|instagram)?\s*__+$", lowered):
+        return True
     return False
+
+
+def _validate_cleaned_text(text: str, title: str, url: str, min_chars: int = DEFAULT_MIN_CHUNK_CHARS) -> bool:
+    """Post-clean validation: check if the cleaned text is worth keeping."""
+    if not text or len(text) < min_chars:
+        return False
+    alnum_or_cjk = sum(c.isalnum() or "一" <= c <= "鿿" for c in text)
+    if alnum_or_cjk / max(len(text), 1) < 0.35:
+        return False
+    # Must have some technical content
+    lowered_all = f"{title}\n{text}".lower()
+    tech_hits = sum(1 for term in ELECTRONIC_TERMS if term.lower() in lowered_all)
+    diag_hits = sum(1 for term in FAULT_TERMS if term.lower() in lowered_all)
+    high_hits = sum(1 for marker in HIGH_VALUE_TEXT_MARKERS if marker in lowered_all)
+    if tech_hits + diag_hits + high_hits < 2:
+        return False
+    return True
 
 
 def _clean_public_tech_page(page: CircuitMarkdownPage) -> CircuitMarkdownPage:
@@ -1028,6 +1496,97 @@ def build_filtered_public_kb(
     return meta
 
 
+def _process_candidate(path: Path, min_chunk_chars: int) -> dict:
+    """Process a single candidate file: parse, clean, filter.
+
+    Returns {"status": "ok", "page": CircuitMarkdownPage} or {"status": "<error>"}.
+    Module-level function so it can be pickled for ProcessPoolExecutor.
+    """
+    try:
+        metadata = parse_markdown_metadata(path)
+    except OSError:
+        return {"status": "read_error"}
+    if is_public_tech_source_allowed(metadata["title"], metadata["url"]):
+        try:
+            page = parse_markdown_page(path)
+        except OSError:
+            return {"status": "read_error"}
+        page = _clean_public_tech_page(page)
+    else:
+        try:
+            page = parse_markdown_page(path)
+        except OSError:
+            return {"status": "read_error"}
+    if not is_useful_page(page, min_chunk_chars):
+        return {"status": "filtered_not_useful"}
+    return {"status": "ok", "page": page}
+
+
+def _process_batch(
+    candidate_batch: list[Path],
+    executor: ProcessPoolExecutor,
+    conn: sqlite3.Connection,
+    seen_urls: set[str],
+    seen_hashes: set[str],
+    stats: Counter[str],
+    min_chunk_chars: int,
+    chunk_chars: int,
+    chunk_overlap: int,
+    progress_every: int,
+    docs: int,
+    chunks: int,
+    max_docs: int,
+) -> tuple[int, int]:
+    """Process a batch of candidate files through parallel parse/clean/filter, then dedup+chunk+insert."""
+    futures = {executor.submit(_process_candidate, p, min_chunk_chars): p for p in candidate_batch}
+    for future in as_completed(futures):
+        stats["phase2_scanned"] += 1
+        if progress_every > 0 and stats["phase2_scanned"] % 500 == 0:
+            print(
+                f"phase2: processed={stats['phase2_scanned']} "
+                f"docs={docs} chunks={chunks} "
+                f"filtered={stats['filtered_not_useful']}",
+                flush=True,
+            )
+        result = future.result()
+        if result["status"] == "read_error":
+            stats["read_errors"] += 1
+            continue
+        if result["status"] == "filtered_not_useful":
+            stats["filtered_not_useful"] += 1
+            continue
+        page_to_index = result["page"]
+        dedupe_key = page_to_index.url or page_to_index.text_hash
+        if dedupe_key in seen_urls or page_to_index.text_hash in seen_hashes:
+            stats["duplicates"] += 1
+            continue
+        page_chunks = chunk_text(
+            page_to_index.text,
+            chunk_chars=chunk_chars,
+            overlap=chunk_overlap,
+            min_chars=min_chunk_chars,
+        )
+        if not page_chunks:
+            stats["no_chunks"] += 1
+            continue
+        page_id = _insert_page(conn, page_to_index)
+        seen_urls.add(dedupe_key)
+        seen_hashes.add(page_to_index.text_hash)
+        docs += 1
+        for index, (chunk, char_start, char_end) in enumerate(page_chunks):
+            chunk_id = _insert_chunk(conn, page_id, index, page_to_index, chunk, char_start, char_end)
+            conn.execute(
+                "INSERT INTO chunks_fts(rowid, title, url, text) VALUES (?, ?, ?, ?)",
+                (chunk_id, page_to_index.title, page_to_index.url, chunk),
+            )
+            chunks += 1
+        if docs >= max_docs:
+            for f in futures:
+                f.cancel()
+            break
+    return docs, chunks
+
+
 def build_diagnosis_kb(
     source_dirs: Iterable[Path | str],
     output_dir: Path | str,
@@ -1038,6 +1597,7 @@ def build_diagnosis_kb(
     chunk_chars: int = DEFAULT_CHUNK_CHARS,
     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     min_chunk_chars: int = DEFAULT_MIN_CHUNK_CHARS,
+    workers: int = 8,
 ) -> dict[str, Any]:
     """Build a high-precision KB focused on circuit fault diagnosis and deep analysis content."""
     output_path = Path(output_dir)
@@ -1059,126 +1619,81 @@ def build_diagnosis_kb(
                 if not source_dir.exists():
                     stats["missing_source_dirs"] += 1
                     continue
-                # Phase 1: fast metadata scan to filter candidates
-                # Use unsorted glob for speed on huge directories (226K+ files)
-                candidate_paths: list[Path] = []
+                # Interleaved scan + process: batch candidates and process immediately
+                # so quick verification builds don't wait for full directory scan
+                BATCH_SIZE = max(500, min(max_docs * 3, 5000))
+                candidate_batch: list[Path] = []
                 stats["phase1_scanned"] = 0
-                for path in source_dir.glob("page_*.md"):
-                    stats["phase1_scanned"] += 1
-                    if progress_every > 0 and stats["phase1_scanned"] % 2000 == 0:
-                        print(
-                            f"phase1: scanned={stats['phase1_scanned']} candidates={len(candidate_paths)} "
-                            f"docs={docs} chunks={chunks}",
-                            flush=True,
+                stats["phase2_scanned"] = 0
+                total_candidates = 0
+
+                with ProcessPoolExecutor(max_workers=workers) as executor:
+                    for path in source_dir.glob("page_*.md"):
+                        stats["phase1_scanned"] += 1
+                        if progress_every > 0 and stats["phase1_scanned"] % 2000 == 0:
+                            print(
+                                f"scan: scanned={stats['phase1_scanned']} "
+                                f"candidates={total_candidates} "
+                                f"docs={docs} chunks={chunks}",
+                                flush=True,
+                            )
+                        if not path.is_file():
+                            continue
+                        try:
+                            if max_file_bytes > 0 and path.stat().st_size > max_file_bytes:
+                                stats["oversized_files"] += 1
+                                continue
+                        except OSError:
+                            stats["read_errors"] += 1
+                            continue
+                        try:
+                            metadata = parse_markdown_metadata(path)
+                        except OSError:
+                            stats["read_errors"] += 1
+                            continue
+                        title = metadata["title"].strip().lower()
+                        url = metadata["url"].strip()
+                        if is_low_value_source(url):
+                            stats["phase1_filtered_low_value"] += 1
+                            continue
+                        if any(marker in title for marker in PUBLIC_TECH_REJECT_TITLES):
+                            stats["phase1_filtered_title"] += 1
+                            continue
+                        if not is_public_tech_source_allowed(title, url):
+                            lowered_meta = f"{title}\n{url}".lower()
+                            if not any(term.lower() in lowered_meta for term in CIRCUIT_DIAGNOSIS_CONTENT_MARKERS[:10]):
+                                stats["phase1_filtered_no_diagnosis_markers"] += 1
+                                continue
+                        candidate_batch.append(path)
+                        total_candidates += 1
+
+                        if len(candidate_batch) >= BATCH_SIZE:
+                            docs, chunks = _process_batch(
+                                candidate_batch, executor, conn,
+                                seen_urls, seen_hashes, stats,
+                                min_chunk_chars, chunk_chars, chunk_overlap,
+                                progress_every, docs, chunks, max_docs,
+                            )
+                            candidate_batch.clear()
+                            if docs >= max_docs:
+                                break
+
+                    # Process remaining candidates
+                    if candidate_batch and docs < max_docs:
+                        docs, chunks = _process_batch(
+                            candidate_batch, executor, conn,
+                            seen_urls, seen_hashes, stats,
+                            min_chunk_chars, chunk_chars, chunk_overlap,
+                            progress_every, docs, chunks, max_docs,
                         )
-                    if not path.is_file():
-                        continue
-                    try:
-                        if max_file_bytes > 0 and path.stat().st_size > max_file_bytes:
-                            stats["oversized_files"] += 1
-                            continue
-                    except OSError:
-                        stats["read_errors"] += 1
-                        continue
-                    try:
-                        metadata = parse_markdown_metadata(path)
-                    except OSError:
-                        stats["read_errors"] += 1
-                        continue
-                    # Fast pre-filter: reject obvious junk by URL/title alone
-                    title = metadata["title"].strip().lower()
-                    url = metadata["url"].strip()
-                    if is_low_value_source(url):
-                        stats["phase1_filtered_low_value"] += 1
-                        continue
-                    if any(marker in title for marker in PUBLIC_TECH_REJECT_TITLES):
-                        stats["phase1_filtered_title"] += 1
-                        continue
-                    # For public tech sources, check URL path eligibility early
-                    if not is_public_tech_source_allowed(title, url):
-                        # Not an allowed public tech source — check if URL suggests circuit content
-                        lowered_meta = f"{title}\n{url}".lower()
-                        if not any(term.lower() in lowered_meta for term in CIRCUIT_DIAGNOSIS_CONTENT_MARKERS[:10]):
-                            stats["phase1_filtered_no_diagnosis_markers"] += 1
-                            continue
-                    candidate_paths.append(path)
+
                 if progress_every > 0:
                     print(
-                        f"phase1 done for {source_dir.name}: "
-                        f"scanned={stats['phase1_scanned']} candidates={len(candidate_paths)}",
+                        f"scan done for {source_dir.name}: "
+                        f"scanned={stats['phase1_scanned']} candidates={total_candidates} "
+                        f"docs={docs} chunks={chunks}",
                         flush=True,
                     )
-
-                # Phase 2: full parse + deep content filtering on candidates only
-                stats["phase2_scanned"] = 0
-                for path in candidate_paths:
-                    stats["phase2_scanned"] += 1
-                    if progress_every > 0 and stats["phase2_scanned"] % 500 == 0:
-                        print(
-                            f"phase2: processed={stats['phase2_scanned']}/{len(candidate_paths)} "
-                            f"docs={docs} chunks={chunks} "
-                            f"filtered={stats['filtered_not_deep_circuit']}",
-                            flush=True,
-                        )
-                    # For Chinese sources (elecfans, eet-china), use public tech source filtering
-                    metadata = parse_markdown_metadata(path)
-                    if is_public_tech_source_allowed(metadata["title"], metadata["url"]):
-                        try:
-                            page = parse_markdown_page(path)
-                        except OSError:
-                            stats["read_errors"] += 1
-                            continue
-                        if not is_public_tech_kb_page(page, min_chunk_chars):
-                            stats["filtered_not_deep_circuit"] += 1
-                            continue
-                        cleaned_page = _clean_public_tech_page(page)
-                        if not is_deep_circuit_page(cleaned_page, min_chunk_chars):
-                            stats["filtered_not_deep_circuit"] += 1
-                            continue
-                        if not is_useful_page(cleaned_page, min_chunk_chars):
-                            stats["filtered_noise_or_short"] += 1
-                            continue
-                        page_to_index = cleaned_page
-                    else:
-                        # For non-Chinese-allowed sources, use general useful + deep circuit checks
-                        try:
-                            page = parse_markdown_page(path)
-                        except OSError:
-                            stats["read_errors"] += 1
-                            continue
-                        if not is_useful_page(page, min_chunk_chars):
-                            stats["filtered_not_deep_circuit"] += 1
-                            continue
-                        if not is_deep_circuit_page(page, min_chunk_chars):
-                            stats["filtered_not_deep_circuit"] += 1
-                            continue
-                        page_to_index = page
-                    dedupe_key = page_to_index.url or page_to_index.text_hash
-                    if dedupe_key in seen_urls or page_to_index.text_hash in seen_hashes:
-                        stats["duplicates"] += 1
-                        continue
-                    page_chunks = chunk_text(
-                        page_to_index.text,
-                        chunk_chars=chunk_chars,
-                        overlap=chunk_overlap,
-                        min_chars=min_chunk_chars,
-                    )
-                    if not page_chunks:
-                        stats["no_chunks"] += 1
-                        continue
-                    page_id = _insert_page(conn, page_to_index)
-                    seen_urls.add(dedupe_key)
-                    seen_hashes.add(page_to_index.text_hash)
-                    docs += 1
-                    for index, (chunk, char_start, char_end) in enumerate(page_chunks):
-                        chunk_id = _insert_chunk(conn, page_id, index, page_to_index, chunk, char_start, char_end)
-                        conn.execute(
-                            "INSERT INTO chunks_fts(rowid, title, url, text) VALUES (?, ?, ?, ?)",
-                            (chunk_id, page_to_index.title, page_to_index.url, chunk),
-                        )
-                        chunks += 1
-                    if docs >= max_docs:
-                        break
                 if docs >= max_docs:
                     break
         conn.execute("INSERT INTO kb_meta(key, value) VALUES (?, ?)", ("tokenizer", "trigram"))

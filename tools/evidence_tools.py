@@ -16,7 +16,7 @@ import yaml
 from pydantic import Field
 
 from agent.prompts import (
-    FINAL_ANSWER_SYSTEM_PROMPT,
+    build_final_answer_system_prompt,
     VISION_SYSTEM_PROMPT,
     build_final_answer_user_prompt,
     build_vision_user_prompt,
@@ -719,9 +719,10 @@ class FinishAnswerExecutor(BaseEvidenceExecutor):
     tool_name = "finish_answer"
     action_name = "synthesize_final_answer"
 
-    def __init__(self, llm: LLMClient, max_evidence: int = 12) -> None:
+    def __init__(self, llm: LLMClient, max_evidence: int = 12, has_local_retrieval: bool = True) -> None:
         self.llm = llm
         self.max_evidence = max_evidence
+        self.has_local_retrieval = has_local_retrieval
 
     def __call__(self, action: FinishAnswerAction, conversation: Any = None) -> TextObservation:
         evidence = [Evidence(**item) for item in action.evidence]
@@ -740,7 +741,7 @@ class FinishAnswerExecutor(BaseEvidenceExecutor):
                 [
                     {
                         "role": "system",
-                        "content": FINAL_ANSWER_SYSTEM_PROMPT,
+                        "content": build_final_answer_system_prompt(self.has_local_retrieval),
                     },
                     {
                         "role": "user",

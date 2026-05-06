@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from agent.prompts import build_planner_system_prompt, planner_guidance
 from agent.tool_argument_repair import RepairNotes, repair_action_args
@@ -97,6 +98,10 @@ class OpenHandsEvidenceRuntime:
             dense_weight=float(self.retrieval_cfg.get("dense_weight", 0.65)),
             sparse_weight=float(self.retrieval_cfg.get("sparse_weight", 0.35)),
             dense_retriever=self._dense_retriever,
+            cross_encoder_reranker=self._build_cross_encoder_reranker(),
+            hybrid_threshold=float(self.retrieval_cfg.get("hybrid_score_threshold", 0.15)),
+            high_relevance_threshold=float(self.retrieval_cfg.get("high_relevance_threshold", 0.4)),
+            max_chunks_per_url=int(self.retrieval_cfg.get("max_chunks_per_url", 2)),
         )
         self.local_kb_status = self.local_retriever.status()
         if bool(self.agent_cfg.get("enable_local_retrieval", False)) and not self.local_kb_status.usable:
@@ -178,7 +183,10 @@ class OpenHandsEvidenceRuntime:
             openhands_browser_require_installed=bool(self.agent_cfg.get("openhands_browser_require_installed", True)),
         )
         self.rank_tool = EvidenceRankExecutor()
-        self.finish_tool = FinishAnswerExecutor(self.answer_llm)
+        self.finish_tool = FinishAnswerExecutor(
+            self.answer_llm,
+            has_local_retrieval=bool(self.agent_cfg.get("enable_local_retrieval", False)),
+        )
 
     def run_sample(self, sample: StandardSample) -> InferenceResult:
         start = time.perf_counter()
@@ -417,6 +425,7 @@ class OpenHandsEvidenceRuntime:
         start: float,
         max_total_seconds: float,
     ) -> tuple[AgentAction, RepairNotes]:
+        query_translator = self._build_llm_query_translator() if self._should_use_llm_query_translation() else None
         repaired_args, repair_notes = repair_action_args(
             action.tool_name,
             action.args,
@@ -427,6 +436,7 @@ class OpenHandsEvidenceRuntime:
             next_seed_query=lambda: self._next_seed_query(state),
             select_read_target=lambda url: self._select_read_target(state, url),
             allow_llm=self._can_start_action("finish_answer", start, max_total_seconds),
+            query_translator=query_translator,
         )
         return AgentAction(tool_name=action.tool_name, args=repaired_args, reason=action.reason, stop=action.stop), repair_notes
 
@@ -1053,6 +1063,57 @@ class OpenHandsEvidenceRuntime:
             retriever.load_index()
             return retriever
         return None
+
+    def _should_use_llm_query_translation(self) -> bool:
+        return bool(
+            self.retrieval_cfg.get("enable_llm_query_rewriting", False)
+            or self.agent_cfg.get("enable_llm_query_rewriting", False)
+        )
+
+    def _build_llm_query_translator(self) -> Callable[[str], str | None] | None:
+        if not self.llm.available:
+            return None
+
+        def translate(chinese_query: str) -> str | None:
+            if not self.llm.available:
+                return None
+            prompt = (
+                "Translate the following Chinese electronics troubleshooting query "
+                "into concise English technical keywords for retrieving English "
+                "technical documents. Preserve ALL model numbers (e.g., TL431, LM358, UC3842), "
+                "reference designators (e.g., R5, C24, Q1), and numerical values "
+                "(e.g., 10k, 220V, 100uF) exactly as they appear. "
+                "Return ONLY the translated query, no explanations, no extra text."
+            )
+            try:
+                response = self.llm.chat(
+                    [
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": chinese_query},
+                    ],
+                    temperature=0.0,
+                )
+                if response.content:
+                    translated = response.content.strip()
+                    if translated and translated != chinese_query:
+                        return translated
+            except Exception:
+                pass
+            return None
+
+        return translate
+
+    def _build_cross_encoder_reranker(self):
+        if not bool(self.retrieval_cfg.get("enable_cross_encoder_rerank", False)):
+            return None
+        model_name = str(self.retrieval_cfg.get("cross_encoder_model", "BAAI/bge-reranker-v2-m3"))
+        device = str(self.retrieval_cfg.get("cross_encoder_device",
+                                            self.retrieval_cfg.get("device", "cuda")))
+        try:
+            from tools.circuit_kb import CrossEncoderReranker
+            return CrossEncoderReranker(model_name=model_name, device=device)
+        except Exception:
+            return None
 
     def _classify(self, question: str) -> str:
         upper = question.upper()

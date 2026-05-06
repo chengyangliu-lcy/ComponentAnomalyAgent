@@ -221,15 +221,15 @@ class DenseRetriever:
         return [(float(scores[idx]), self._chunk_ids[idx]) for idx in top_indices]
 
     def _encode_batch(self, texts: list[str], *, prompt_name: str | None = None, progress_every: int = 0) -> np.ndarray:
-        all_embeddings: list[np.ndarray] = []
+        """Encode texts in batches, optionally with progress output."""
         total = len(texts)
-        for start in range(0, total, self.batch_size):
-            batch = texts[start:start + self.batch_size]
-            batch_embeddings = self._model.encode(
-                batch, prompt_name=prompt_name,
-                normalize_embeddings=self.normalize, show_progress_bar=False,
-            )
-            all_embeddings.append(np.asarray(batch_embeddings))
-            if progress_every > 0 and (start // self.batch_size + 1) % progress_every == 0:
-                print(f"encoded {min(start + self.batch_size, total)}/{total} chunks", flush=True)
-        return np.concatenate(all_embeddings, axis=0)
+        if progress_every > 0:
+            print(f"encoding {total} chunks (batch_size={self.batch_size})...", flush=True)
+        embeddings = self._model.encode(
+            texts,
+            prompt_name=prompt_name,
+            normalize_embeddings=self.normalize,
+            batch_size=self.batch_size,
+            show_progress_bar=False,
+        )
+        return np.asarray(embeddings)

@@ -74,6 +74,7 @@ def repair_action_args(
     next_seed_query: Callable[[], str],
     select_read_target: Callable[[str], Evidence | None],
     allow_llm: bool,
+    query_translator: Callable[[str], str | None] | None = None,
 ) -> tuple[dict[str, Any], RepairNotes]:
     repaired = dict(args)
     repaired.pop("_meta", None)
@@ -82,7 +83,7 @@ def repair_action_args(
     if tool_name == "web_search":
         repaired, notes = _repair_web_search(repaired, notes, question, max_web_results, next_seed_query)
     elif tool_name == "local_retrieve":
-        repaired, notes = _repair_local_retrieve(repaired, notes, question, rank_limit, next_seed_query)
+        repaired, notes = _repair_local_retrieve(repaired, notes, question, rank_limit, next_seed_query, query_translator=query_translator)
     elif tool_name == "web_read":
         repaired, notes = _repair_web_read(repaired, notes, select_read_target)
     elif tool_name == "rank_evidence":
@@ -114,17 +115,21 @@ def _repair_local_retrieve(
     question: str,
     max_results: int,
     next_seed_query: Callable[[], str],
+    query_translator: Callable[[str], str | None] | None = None,
 ) -> tuple[dict[str, Any], RepairNotes]:
     query = str(args.get("query") or "").strip()
     if not query:
         query = next_seed_query().strip() or _build_question_query(question)
         if query:
             notes.add("local_retrieve query filled from question terms")
-    rewritten = _rewrite_local_retrieve_query(query, question)
+    rewritten = _rewrite_local_retrieve_query(query, question, query_translator=query_translator)
     if rewritten != query:
         notes.query_rewrite_before = query or None
         notes.query_rewrite_after = rewritten
-        notes.add("local_retrieve query expanded with English circuit terms")
+        if query_translator is not None and _contains_cjk(query):
+            notes.add("local_retrieve query LLM-translated to English")
+        else:
+            notes.add("local_retrieve query expanded with English circuit terms")
     args["query"] = rewritten
     limit = args.get("limit")
     if not isinstance(limit, int):
@@ -139,8 +144,23 @@ def _repair_local_retrieve(
     return args, notes
 
 
-def _rewrite_local_retrieve_query(query: str, question: str) -> str:
+def _contains_cjk(text: str) -> bool:
+    return bool(re.search(r"[一-鿿]", text or ""))
+
+
+def _rewrite_local_retrieve_query(
+    query: str,
+    question: str,
+    query_translator: Callable[[str], str | None] | None = None,
+) -> str:
     query = re.sub(r"\s+", " ", query or "").strip()
+
+    # LLM-based Chinese-to-English translation (replaces, not just appends)
+    if query_translator is not None and _contains_cjk(query):
+        translated = query_translator(query)
+        if translated and translated != query:
+            query = translated
+
     base_text = f"{question} {query}".strip()
     expansions = expand_chinese_electronics_terms(base_text)
     if not expansions:

@@ -18,8 +18,9 @@ def main() -> int:
     parser.add_argument("--kb-dir", default=None, help="KB directory containing circuit_md.sqlite")
     parser.add_argument("--model", default=None, help="Sentence-transformers model name (e.g. BAAI/bge-m3)")
     parser.add_argument("--device", default=None, help="Device for encoding (cuda, cpu)")
-    parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--progress-every", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=None, help="Encode batch size (higher = faster GPU, more VRAM)")
+    parser.add_argument("--workers", type=int, default=0, help="DataLoader workers for encode pipeline")
+    parser.add_argument("--progress-every", type=int, default=100)
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -30,6 +31,7 @@ def main() -> int:
     model_name = args.model or retrieval_cfg.get("embedding_model", "BAAI/bge-m3")
     device = args.device or retrieval_cfg.get("device", "cuda")
     batch_size = args.batch_size or int(retrieval_cfg.get("embedding_batch_size", 64))
+    workers = args.workers
 
     db_path = kb_dir / "circuit_md.sqlite"
     if not db_path.exists():

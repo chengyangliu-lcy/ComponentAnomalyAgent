@@ -1,0 +1,30 @@
+# Exp 15: Improved KB (v3) + Structured Answer Template
+# Same as Exp13 but with improved multi-language noise cleaning in KB build
+# Goal: measure cleaning improvement impact vs exp13 (old KB, 0.5717)
+# Compare vs exp14 (no KB, 0.5724) to see if improved KB surpasses no-KB baseline
+
+paths:
+  local_kb_index: knowledge_base/circuit_diagnosis_fts_hq_v3
+
+agent:
+  enable_local_retrieval: true
+  max_local_retrieval_calls: 2
+  max_local_docs: 4
+  max_local_chunks: 6
+  enable_web_search: true
+  web_search_mode: auto
+
+retrieval:
+  embedding_model: 'Qwen/Qwen3-Embedding-4B'
+  dense_weight: 0.65
+  sparse_weight: 0.35
+  device: cuda
+  embedding_batch_size: 64
+  enable_llm_query_rewriting: true
+  enable_cross_encoder_rerank: true
+  cross_encoder_model: 'BAAI/bge-reranker-v2-m3'
+  cross_encoder_top_n: 30
+  hybrid_score_threshold: 0.15
+  high_relevance_threshold: 0.4
+  max_chunks_per_url: 2
+  enable_contextual_retrieval: true

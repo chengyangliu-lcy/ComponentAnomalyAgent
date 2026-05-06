@@ -73,30 +73,39 @@ runtime 能力：
 - 最终答案提示词，强调先直接回答、基于证据、不编造型号/参数/波形。
 - LLM Judge 提示词，统一输出 JSON 评分字段。
 
-最终答案提示词特别覆盖常见题型：
+最终答案提示词（`FINAL_ANSWER_SYSTEM_PROMPT`）输出结构化 1-5 格式：
 
-- 充电芯片或 LED 状态异常。
-- NTC/浪涌限流选型。
-- 缓启动/预充电阻计算。
-- 运放恒流源/负反馈。
-- RC 或三极管振荡/闪烁灯。
+1. **结论**：先直接回答问题，明确最可能原因或处理方向
+2. **依据**：用题面、图片、KB 或网页证据支撑关键结论
+3. **原因机制**：解释异常为什么发生，强制使用因果链（如 "R161+C24 串联→容抗随频率增大而减小→高频段增益下降→抑制高频噪声放大"），禁止泛化
+4. **检查步骤**：可执行的测量、复核和定位步骤
+5. **处理建议与不确定性**：修改建议 + 证据缺口说明
+
+关键规则：
+- Rule 9：KB 证据自然融入，不写"根据本地知识库"；如图片矛盾采信图片
+- Rule 10：不得编造题面和证据中均未出现的元件标号、参数值或型号
+- Rule 11：常见题型（LED/NTC/缓启动/运放恒流源/RC 振荡）必须覆盖的要点
+
+`build_final_answer_user_prompt` 将 evidence_text 和 question_hints 注入 `<证据>` 和 `<题面线索>` 标签，指导 LLM 按结构化格式输出。
 
 ### 5. LLM 客户端增强
 
 `llm_client.py` 已支持：
 
 - OpenAI-compatible chat completion。
+- Provider 系统：`dashscope` / `vllm` / `openai`，通过 `configs/local.yaml` 的 `model.provider` 切换。
+- 每个 provider 独立配置 `base_url`、`api_key` 和 `extra_body`（DashScope 需 `enable_thinking: false`）。
 - timeout 和 max_retries。
 - `extra_body`，用于 DashScope/Qwen 的 `enable_thinking: false` 等参数。
 - `response_format`，用于 planner/Judge JSON 输出。
 - `json_chat` 自动剥离 Markdown code fence 并解析 JSON。
-- `_repair_truncated_json`：对截断或格式错误的 JSON 尝试修复——自动补齐闭合括号，逐步移除尾部残缺片段后重新解析。对 `max_tokens` 不足导致的截断（如 score ~4935 chars 处截断）已验证可修复。
+- `_repair_truncated_json`：对截断或格式错误的 JSON 尝试修复——自动补齐闭合括号，逐步移除尾部残缺片段后重新解析。对 `max_tokens` 不足导致的截断已验证可修复。
 
-默认模型配置位于 `configs/default.yaml`：
+默认模型配置位于 `configs/default.yaml` 和 `configs/local.yaml`：
 
-- `AGENT_MODEL` / `default_agent_model`
-- `VISION_MODEL` / `default_vision_model`
-- `JUDGE_MODEL` / `default_judge_model`
+- `model.provider`：当前为 `dashscope`
+- `model.api_key` / `model.default_base_url`：API 入口
+- `model.default_agent_model` / `model.default_vision_model` / `model.default_judge_model`
 - planner、vision、answer 分别可配置 `extra_body`
 - judge 专用 `max_tokens` 通过 `evaluation.judge_max_tokens` 配置，默认 4000（独立于 `model.max_tokens`）
 
@@ -150,70 +159,87 @@ runtime 能力：
 
 ### 7.5 知识库检索策略
 
-当前知识库是 `knowledge_base/circuit_diagnosis_fts`（SQLite FTS5 + Dense 向量索引），存储从 elecfans.com 等电子技术网站爬取的电路诊断技术文档（12,111 条候选 chunks）。
+当前知识库是 `knowledge_base/circuit_diagnosis_fts_hq_v2`（SQLite FTS5 + Dense 向量索引），包含 5,924 chunks / 5,584 docs，来自电路诊断技术文档（经过严格过滤，相比旧版 57k chunks 减少 90% 噪声）。
 
-**检索方式**：混合检索（Dense 65% + Sparse 35%）
+**完整检索 Pipeline**（配置入口：`configs/experiments/exp13_structured.yaml`）：
 
-- Dense：Qwen3-Embedding-4B 向量检索，语义匹配
-- Sparse：SQLite FTS5 + BM25 重排序，关键词匹配
-- 合并后按 hybrid score 排序，每 URL 最多取 2 chunks
+1. **LLM Query Rewriting**：将中文题面改写为英文电子关键词，保留型号、位号和数值
+2. **Dense Retrieval**：Qwen3-Embedding-4B（2560-dim）向量语义检索，权重 65%
+3. **Sparse Retrieval**：SQLite FTS5 + BM25 关键词检索，权重 35%
+4. **Hybrid Merge**：dense + sparse 分数融合，threshold=0.15
+5. **Cross-Encoder Rerank**：BAAI/bge-reranker-v2-m3 对 top-30 候选精排
+6. **Contextual Retrieval**：chunk 前预置文档级上下文，提升匹配精度
 
-**多层过滤**（候选 → 高相关性仅保留 12.2%）：
+**多层过滤**：
 
-1. 低价值来源过滤（非技术类 URL）
-2. 水文/模板文本过滤
-3. 低价值项目过滤
-4. Required terms 过滤（query 关键词须在结果中出现）
-5. 低相关性过滤（sparse score < 5.0 或 hybrid score < 0.15）
+1. 低价值来源/水文/模板文本/低价值项目过滤
+2. Required terms 过滤（query 关键词须在结果中出现）
+3. Hybrid score < 0.15 过滤
+4. 每 URL 最多 2 chunks
+5. 最终仅保留 high_relevance >= 0.4 的 chunks
 
-**调用门槛**（`openhands_runtime._should_use_local_retrieval`）：
+**调用策略**（`planner_guidance`）：
 
-- 必须同时满足：有强实体（型号/位号/参数值）+ 有故障/公式/拓扑需求
-- 如果有图片证据但缺上述条件，优先用图片而跳过 KB
-- 每样本最多调用 1 次，返回最多 4 chunks
+- 当题面包含明确型号、位号、数值、拓扑词或故障症状时优先调用 KB
+- KB 证据会被 rank_evidence 排序并进入最终答案（不再丢弃）
+- 每样本最多 2 次调用，每次最多 4 docs / 6 chunks
+- 中文题面须改写为英文关键词检索（本地库以英文为主）
+
+**检索诊断指标**（Exp13 full 368 样本）：
+
+| 指标 | 值 |
+|------|-----|
+| local_retrieve 触发率 | 335/368 = 91.0% |
+| 检索非空率 | 84.2% |
+| 平均返回 chunks | 4.3 |
+| 候选 → 高相关性 | 1,434/26,299 = 5.5% |
+| KB 证据实际利用率 | 0.8%（指标自身可能不准，检测方式依赖文本标记） |
 
 配置入口：
 
-- `agent.enable_local_retrieval`
-- `agent.max_local_retrieval_calls`
-- `agent.max_local_docs`
-- `agent.max_local_chunks`
-- `retrieval.embedding_model`
-- `retrieval.dense_weight` / `retrieval.sparse_weight`
+- `paths.local_kb_index`
+- `agent.enable_local_retrieval` / `max_local_retrieval_calls` / `max_local_docs` / `max_local_chunks`
+- `retrieval.embedding_model` / `dense_weight` / `sparse_weight` / `device`
+- `retrieval.enable_llm_query_rewriting` / `enable_cross_encoder_rerank` / `enable_contextual_retrieval`
+- `retrieval.cross_encoder_model` / `cross_encoder_top_n` / `hybrid_score_threshold` / `high_relevance_threshold` / `max_chunks_per_url`
 
-### 7.6 最新实验对比（2025-05-01）
+### 7.6 最新实验对比（2025-05-05）
 
-两组实验各 368 样本，对比有知识库 vs 无知识库的效果：
+经过 10+ 轮实验迭代，最终结论：**KB 策略对分数的提升微乎其微（~0.02），结构化答案模板是最大单项改进。**
 
-| 指标 | 有 KB (kb_rag_full_v4_web) | 无 KB (agent_full_v4) | Delta |
-|---|---|---|---|
-| final_score mean | 0.5809 | 0.5805 | +0.004 |
-| llm_judge score | 0.6877 | 0.677 | +0.011 |
-| accuracy | 3.51 | 3.45 | +0.07 |
-| factual_consistency | 0.728 | 0.711 | +0.017 |
-| semantic_similarity | 0.767 | 0.767 | ~0 |
-| scoring_point_coverage | 0.389 | 0.401 | -0.012 |
-| fully_correct | 3/368 | 1/368 | +2 |
+#### 100 样本对照实验（Exp10-Exp13）
 
-逐样本胜负：RAG 赢 152 / Agent 赢 149 / 平局 67。
+| Exp | final_score | llm_judge | factual | 描述 |
+|-----|:-----------:|:---------:|:-------:|------|
+| Exp12 | 0.5508 | 0.624 | 0.6465 | 无 KB + 灵活模板 |
+| Exp11 | 0.5481 | 0.6065 | 0.633 | v2 KB only（无检索特性，灵活模板） |
+| Exp10 | 0.5647 | 0.623 | 0.6475 | v2 KB + 检索特性 + 灵活模板 |
+| Exp13 | 0.5717 | 0.6571 | 0.6925 | v2 KB + 检索特性 + **结构化模板** |
 
-**核心结论**：知识库几乎未带来提升（final_score 差仅 0.004），三大原因：
+关键发现：
+- **KB alone 反而有害**：Exp11 < Exp12，Δ=-0.0027。只加 KB 不加检索特性，噪声大于收益
+- **检索特性带来小幅提升**：Exp10 > Exp12，Δ=+0.014。cross-encoder + query rewriting + contextual retrieval 合计贡献约 0.014
+- **结构化模板是最大单项改进**：Exp13 > Exp10，Δ=+0.007。从灵活模板恢复 1-5 编号格式（结论/依据/原因机制/检查步骤/处理建议）带来显著提升
 
-1. **检索门槛太严**：只在"强实体 + 故障/拓扑"时触发，55% 的题目不调 KB
-2. **过滤太狠**：候选 2329 → 保留 283（88% 被丢弃），检索非空率仅 49%
-3. **知识利用率为 0**：`kb_evidence_used_rate = 0.27%`，planner 拿到 KB 内容后未有效融入答案
+#### 全量 368 样本：Exp13 vs Baseline（均去重）
 
-KB 诊断数据（kb_rag 实验）：
+| 指标 | Baseline(368) | Exp13(368) | Δ |
+|------|:-----------:|:---------:|:--:|
+| final_score | 0.5789 | 0.5799 | **+0.0010** |
+| llm_judge.score | 0.6713 | 0.6705 | -0.0008 |
+| accuracy | 3.42 | 3.44 | +0.016 |
+| factual_consistency | 0.7069 | 0.6992 | -0.0077 |
+| critical_error_rate | 42.7% | 42.1% | -0.54% |
+| core_conclusion_hit | 68.4% | 70.6% | +2.19% |
 
-| 指标 | 值 |
-|---|---|
-| local_retrieve 触发率 | 167/368 = 45.4% |
-| 检索非空率 | 49.1% |
-| avg_chunks 返回 | 1.7 |
-| KB 证据用于答案率 | 0.27% |
-| 候选 → 高相关性 | 283/2329 = 12.2% |
+**核心结论：**
 
-潜在改进方向：放宽检索触发条件和过滤策略；优化 planner prompt 让其更积极将 KB 知识融入答案。
+Baseline（agent_full_v4_rerun）使用的是旧 57k 噪声 KB，实际上 Knowledge Base 贡献近似于零。Exp13 用 v2 KB（5,924 chunks，1/10 规模）+ 检索特性 + 结构化模板，在全部 368 条样本上与旧 baseline 打平并微弱反超。但本质上是**模板和提示词工程**驱动了提升，知识库本身从 v1 到 v2 的改进带来的分数提升不超过 0.02。
+
+这意味着后续改进方向应该更关注：
+1. KB 内容质量（当前 KB 缺少考题需要的因果链、公式推导等）
+2. 证据到答案的转换效率（LLM 如何将 KB chunk 转化为答案段落）
+3. 提示词优化（已经证明提示词改动可以带来 0.007+ 提升）
 
 ### 8. 统一评测体系
 
@@ -400,22 +426,22 @@ uv run python scripts/download_models.py
 uv run python scripts/validate_data.py
 ```
 
+全量推理（使用 Exp13 配置，5 并发）：
+
+```bash
+uv run python scripts/run_infer.py --config configs/experiments/exp13_structured.yaml --experiment exp13_full --max-workers 5
+```
+
+限定样本数推理：
+
+```bash
+uv run python scripts/run_infer.py --config configs/experiments/exp13_structured.yaml --experiment exp13_test --limit 100 --max-workers 5
+```
+
 单样本推理：
 
 ```bash
 uv run python scripts/run_infer.py --sample-id 1326045 --experiment test_one --no-resume
-```
-
-禁用联网推理：
-
-```bash
-uv run python scripts/run_infer.py --sample-id 1326045 --experiment reason_only --disable-web --no-resume
-```
-
-按固定样本文件推理：
-
-```bash
-uv run python scripts/run_infer.py --sample-ids-file sample_ids.txt --experiment agent_fixed --no-resume
 ```
 
 推理后评测：
@@ -549,8 +575,9 @@ configs/default.yaml
 - `tools/image_resolver.py`：图片路径解析。
 - `tools/sample_ids.py`：样本 ID 文件读取和过滤。
 - `tools/utils.py`：JSONL/JSON 写入、文本压缩、timer。
-- `tools/circuit_kb.py`：知识库混合检索（Dense + Sparse + 多层过滤）。
-- `tools/retriever.py`：Dense vector retriever (Qwen3-Embedding-4B)。
+- `tools/circuit_kb.py`：知识库混合检索（Dense + Sparse + Cross-encoder + 多层过滤）。
+- `tools/dense_retriever.py`：Dense vector retriever (Qwen3-Embedding-4B)，共享加载。
+- `configs/experiments/`：实验配置文件目录（exp10-exp13 等）。
 - `evaluator/evaluate.py`：统一评测入口。
 - `evaluator/llm_judge.py`：LLM Judge（三层兜底：JSON 解析 → 修复 → 正则提取）。
 - `evaluator/rouge_eval.py`：Claim ROUGE-L。
@@ -572,18 +599,10 @@ configs/default.yaml
 
 ## 最近提交历史
 
-- `9ae75cc feat: unify qwen baseline evaluation`
-- `0997084 feat: add agentic evidence runtime`
-- `aa07223 feat: add experiment sample utilities`
-- `a098ad9 feat: add resumable concurrent run scripts`
-- `8dd21d9 feat: unify evaluation scoring`
-- `8840b21 feat: improve web evidence retrieval`
-- `fca4066 Initial ComponentAnomalyAgent implementation`
-
-## 最近代码改动（2025-05-01，未提交）
-
-- `llm_client.py`：新增 `_repair_truncated_json`，对截断 JSON 尝试闭合修复
-- `evaluator/llm_judge.py`：三层解析兜底（JSON → 修复 → 正则提取），只做一次 LLM 调用；新增 `_regex_fallback_extract`；日志记录 fallback 情况
-- `evaluator/evaluate.py`：judge `max_tokens` 从 `model.max_tokens` 改为 `evaluation.judge_max_tokens`，默认 4000
-- `scripts/repair_eval.py`：新增修复脚本，只重新评测 LLM Judge 失败的样本
+- `0b025fd feat: 恢复结构化答案模板 + 强化KB证据规则与反幻觉机制`（当前 HEAD）
+- `5c0b894 feat: 将本地知识库从 Hackster 替换为 Circuit Markdown，引入 DenseRetriever`
+- `e11b3e0 feat: 集成 Hackster 本地知识库混合检索工具`
+- `e13ffe1 feat: overhaul evaluation metrics for technical Q&A`
+- `fa10b9e feat: 引入 tool registry 与 action 参数自动修复机制`
+- `ed6c2fe feat: 添加 OpenHands 浏览器作为网页读取主后端`
 

@@ -20,6 +20,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default=None)
     parser.add_argument("--experiment", default="agent_experiment")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--max-workers", type=int, default=None)
+    parser.add_argument("--eval-max-workers", type=int, default=None)
     parser.add_argument("--enable-web", action="store_true")
     parser.add_argument("--disable-web", action="store_true")
     parser.add_argument("--baseline-eval", default=None)
@@ -49,6 +51,8 @@ def main() -> None:
         infer_cmd.extend(["--config", args.config])
     if args.limit is not None:
         infer_cmd.extend(["--limit", str(args.limit)])
+    if args.max_workers is not None:
+        infer_cmd.extend(["--max-workers", str(args.max_workers)])
     if args.enable_web:
         infer_cmd.append("--enable-web")
     if args.disable_web:
@@ -57,6 +61,9 @@ def main() -> None:
     eval_cmd = [sys.executable, "scripts/run_eval.py", "--experiment", args.experiment, "--predictions", str(predictions)]
     if args.config:
         eval_cmd.extend(["--config", args.config])
+    eval_workers = args.eval_max_workers or args.max_workers
+    if eval_workers is not None:
+        eval_cmd.extend(["--max-workers", str(eval_workers)])
     _run(eval_cmd)
     if args.baseline_eval:
         baseline_rows = _read_jsonl(Path(args.baseline_eval))

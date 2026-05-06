@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from agent.prompts import (
-    FINAL_ANSWER_SYSTEM_PROMPT,
+    build_final_answer_system_prompt,
     JUDGE_SYSTEM_PROMPT,
     PLANNER_SYSTEM_PROMPT,
     VISION_SYSTEM_PROMPT,
@@ -45,7 +45,7 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("不要输出 JSON", text)
 
     def test_final_answer_prompt_requires_evidence_grounded_sections(self) -> None:
-        text = FINAL_ANSWER_SYSTEM_PROMPT + build_final_answer_user_prompt(
+        text = build_final_answer_system_prompt() + build_final_answer_user_prompt(
             "R1 发热为什么",
             "[1] 图片证据\n来源: image_inspect\nR1 位于 MOS 栅极附近",
             ["R1", "MOS"],

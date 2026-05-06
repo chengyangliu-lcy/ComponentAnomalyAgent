@@ -1,0 +1,26 @@
+# Exp18: v2 KB + LLM Query Translation + Strict Retrieval
+# Verify whether v3 KB quality is the cause of score drop
+# Uses v2 KB (which had stricter build filtering) with optimized retrieval settings
+
+paths:
+  local_kb_index: knowledge_base/circuit_diagnosis_fts_hq_v2
+
+agent:
+  enable_local_retrieval: true
+  max_local_retrieval_calls: 3
+  max_local_docs: 4
+  max_local_chunks: 6
+  enable_web_search: true
+  web_search_mode: auto
+
+retrieval:
+  embedding_model: 'Qwen/Qwen3-Embedding-4B'
+  dense_weight: 0.65
+  sparse_weight: 0.35
+  device: cuda
+  embedding_batch_size: 64
+  enable_llm_query_rewriting: true
+  enable_cross_encoder_rerank: false
+  hybrid_score_threshold: 0.2
+  high_relevance_threshold: 0.45
+  max_chunks_per_url: 1

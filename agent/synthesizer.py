@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List
 
-from agent.prompts import FINAL_ANSWER_SYSTEM_PROMPT, build_final_answer_user_prompt
+from agent.prompts import build_final_answer_system_prompt, build_final_answer_user_prompt
 from llm_client import LLMClient
 from schemas import Evidence, StandardSample
 from tools.utils import compact_text
@@ -46,7 +46,7 @@ class AnswerSynthesizer:
         messages = [
             {
                 "role": "system",
-                "content": FINAL_ANSWER_SYSTEM_PROMPT,
+                "content": build_final_answer_system_prompt(),
             },
             {
                 "role": "user",

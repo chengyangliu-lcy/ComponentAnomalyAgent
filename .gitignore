@@ -4,7 +4,7 @@
 /data/
 /dataset/
 /bbs_2025_md/
-
+tmp/
 # Future local knowledge bases should be mounted or copied locally, not committed by default.
 /knowledge_base/
 
