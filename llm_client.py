@@ -80,6 +80,54 @@ class LLMClient:
         except Exception as exc:  # noqa: BLE001
             return LLMResponse(content="", token_usage={}, error=str(exc))
 
+    def search_chat(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: float | None = None,
+        timeout: float | None = None,
+        max_tokens: int | None = None,
+    ) -> LLMResponse:
+        """Call the LLM with DashScope's built-in internet search enabled.
+
+        Uses extra_body={'enable_search': True} to activate the model's
+        native web search capability. The model will automatically search
+        the internet and include results in its response.
+
+        Search operations typically need more time than regular chat, so
+        a longer default timeout (90s) is used when the caller doesn't
+        specify one.  A higher default max_tokens (2000) is used because
+        search results are typically longer than planner JSON output.
+        """
+        if not self._client:
+            return LLMResponse(
+                content="",
+                token_usage={},
+                error="LLM API key is not configured; fallback logic was used.",
+            )
+        search_timeout = timeout or max(self.timeout or 0, 90)
+        search_max_tokens = max_tokens or max(self.max_tokens, 2000)
+        try:
+            search_extra_body = dict(self.extra_body)
+            search_extra_body["enable_search"] = True
+            payload: Dict[str, Any] = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": self.temperature if temperature is None else temperature,
+                "max_tokens": search_max_tokens,
+                "timeout": search_timeout,
+            }
+            if search_extra_body:
+                payload["extra_body"] = search_extra_body
+            response = self._client.chat.completions.create(**payload)
+            usage = getattr(response, "usage", None)
+            token_usage = usage.model_dump() if hasattr(usage, "model_dump") else {}
+            return LLMResponse(
+                content=(response.choices[0].message.content or "").strip(),
+                token_usage=token_usage,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return LLMResponse(content="", token_usage={}, error=str(exc))
+
     def json_chat(
         self,
         messages: List[Dict[str, Any]],

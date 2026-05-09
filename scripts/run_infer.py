@@ -231,21 +231,85 @@ def _is_hard_failed(row: dict[str, Any]) -> bool:
 
 def _write_trace(trace_dir: Path, row: dict[str, Any]) -> None:
     sample_id = str(row.get("sample_id") or "unknown")
+    answer = row.get("answer", "")
+    steps = _compact_tool_trace(row.get("tool_trace", []), answer=answer)
+    # Insert question as first user message
+    steps.insert(0, {"step": 0, "role": "user", "content": row.get("question", "")})
     trace_payload = {
         "sample_id": sample_id,
-        "question": row.get("question", ""),
-        "answer": row.get("answer", ""),
-        "plan": row.get("plan"),
-        "reasoning_summary": row.get("reasoning_summary", ""),
-        "tools_used": row.get("tools_used", []),
-        "web_searched": row.get("web_searched", False),
         "elapsed_seconds": row.get("elapsed_seconds", 0.0),
-        "token_usage": row.get("token_usage", {}),
         "errors": row.get("errors", []),
-        "tool_trace": row.get("tool_trace", []),
-        "trace_stats": _trace_stats(row),
+        "steps": steps,
     }
     write_json(trace_dir / f"{sample_id}.trace.json", trace_payload)
+
+
+def _compact_tool_trace(events: list[dict[str, Any]], answer: str = "") -> list[dict[str, Any]]:
+    """Reconstruct agent conversation as system/user/assistant/tool steps."""
+    steps = []
+    step_num = 0
+
+    for evt in events:
+        tool = evt.get("tool_name", "")
+        action = evt.get("action", "")
+        outputs = evt.get("outputs", {})
+
+        # Skip bootstrap events
+        if tool == "agent_planner" and action == "initialize_loop":
+            continue
+        if tool == "openhands_sdk":
+            continue
+
+        # Planner select_action → assistant message
+        if tool == "agent_planner" and action == "select_action":
+            step_num += 1
+            effective = outputs.get("effective_action") or outputs.get("validated_action") or {}
+            chosen = effective.get("tool_name", "")
+            args = effective.get("args", {})
+            reason = effective.get("reason", "")
+            # Strip _meta from args
+            clean_args = {k: v for k, v in args.items() if k != "_meta" and v is not None}
+            assistant_msg = {"tool": chosen}
+            if clean_args:
+                assistant_msg["args"] = clean_args
+            if reason:
+                assistant_msg["reason"] = reason
+            steps.append({"step": step_num, "role": "assistant", "content": assistant_msg})
+            continue
+
+        # Planner rejected action → assistant error
+        if tool == "agent_planner" and action != "select_action":
+            step_num += 1
+            steps.append({"step": step_num, "role": "assistant", "content": {"error": evt.get("summary", "")}})
+            continue
+
+        # Tool execution → tool message
+        obs = outputs.get("observation", {})
+        evidences = obs.get("evidence", [])
+        tool_content: dict[str, Any] = {"tool": tool, "success": evt.get("success", False)}
+
+        # Extract key info from inputs
+        inputs = evt.get("inputs", {})
+        if inputs.get("query"):
+            tool_content["query"] = inputs["query"]
+
+        # finish_answer: attach the final answer text
+        if tool == "finish_answer" and answer:
+            tool_content["answer"] = answer
+        elif evidences:
+            # Evidence: only keep source + content (skip title which is often redundant)
+            tool_content["evidence"] = [
+                {"source": e.get("source"), "content": e.get("content")}
+                for e in evidences
+            ]
+
+        # Error
+        if evt.get("error"):
+            tool_content["error"] = evt["error"]
+
+        steps.append({"step": step_num, "role": "tool", "content": tool_content})
+
+    return steps
 
 
 def _trace_stats(row: dict[str, Any]) -> dict[str, Any]:

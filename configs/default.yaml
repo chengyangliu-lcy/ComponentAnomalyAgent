@@ -59,6 +59,8 @@ agent:
   enable_local_retrieval: true
   allow_test_corpus_retrieval: false
   enable_web_search: true
+  enable_qwen_search: false
+  max_qwen_search_calls: 2
   web_search_mode: auto
   enable_llm_web_decision: false
   min_evidence_before_search: 2
@@ -75,11 +77,11 @@ agent:
 
 web:
   provider_order:
+    - html
     - tavily
     - brave
     - bing
     - serpapi
-    - html
   max_results_per_query: 6
   max_pages_to_read: 3
   api_key_envs:

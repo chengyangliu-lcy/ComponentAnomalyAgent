@@ -90,6 +90,8 @@ def repair_action_args(
         repaired, notes = _repair_rank_evidence(repaired, notes, rank_limit)
     elif tool_name == "finish_answer":
         repaired, notes = _repair_finish_answer(repaired, notes, allow_llm)
+    elif tool_name == "qwen_search":
+        repaired, notes = _repair_qwen_search(repaired, notes, question, next_seed_query)
     elif tool_name in {"inspect_image", "review_evidence", "match_domain_skill"}:
         repaired, notes = _normalize_simple_args(tool_name, repaired, notes)
 
@@ -229,6 +231,35 @@ def _repair_web_read(
         if not str(args.get("snippet") or "").strip() and selected.content:
             args["snippet"] = selected.content[:500]
             notes.add("web_read snippet filled from selected evidence")
+    return args, notes
+
+
+def _repair_qwen_search(
+    args: dict[str, Any],
+    notes: RepairNotes,
+    question: str,
+    next_seed_query: Callable[[], str],
+) -> tuple[dict[str, Any], RepairNotes]:
+    query = str(args.get("query") or "").strip()
+    original_query = query or None
+    if not query:
+        query = next_seed_query().strip()
+        if query:
+            notes.add("qwen_search query filled from seed query")
+    rewritten = _rewrite_query(query, question)
+    if rewritten != (query or ""):
+        notes.query_rewrite_before = original_query or query or None
+        notes.query_rewrite_after = rewritten
+        notes.add("qwen_search query rewritten with question key terms")
+    query = rewritten.strip()
+    if not query:
+        fallback = _build_question_query(question)
+        if fallback:
+            query = fallback
+            notes.query_rewrite_before = original_query
+            notes.query_rewrite_after = fallback
+            notes.add("qwen_search query generated from question terms")
+    args["query"] = query
     return args, notes
 
 

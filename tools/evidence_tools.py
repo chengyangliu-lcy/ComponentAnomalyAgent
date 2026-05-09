@@ -85,6 +85,10 @@ class LocalRetrieveAction(Action):
     limit: int = 4
 
 
+class QwenSearchAction(Action):
+    query: str
+
+
 class EvidenceRankAction(Action):
     question: str
     evidence: list[dict[str, Any]] = Field(default_factory=list)
@@ -650,6 +654,94 @@ class LocalRetrieveExecutor(BaseEvidenceExecutor):
         )
 
 
+class QwenSearchExecutor(BaseEvidenceExecutor):
+    """Use Qwen's built-in internet search via DashScope enable_search.
+
+    Calls the LLM with enable_search=True so the model automatically
+    searches the web and returns results integrated into its response.
+    The response text (which contains search-sourced content) is captured
+    as evidence for the agent loop.
+    """
+
+    tool_name = "qwen_search"
+    action_name = "qwen_internet_search"
+
+    def __init__(self, llm: LLMClient, enabled: bool = True) -> None:
+        self.llm = llm
+        self.enabled = enabled
+
+    def __call__(self, action: QwenSearchAction, conversation: Any = None) -> EvidenceObservation:
+        run = self.run(action.query)
+        return EvidenceObservation(
+            summary=run.summary,
+            evidence=[item.to_json() for item in run.evidence],
+            errors=run.errors,
+            is_error=not run.success,
+        )
+
+    def run(self, query: str) -> ToolRun:
+        query = (query or "").strip()
+        if not self.enabled:
+            return ToolRun(
+                summary="qwen search disabled by config",
+                success=False,
+                errors=["qwen search disabled"],
+            )
+        if not query:
+            return ToolRun(
+                summary="qwen search skipped: no query",
+                success=False,
+                errors=["no qwen search query"],
+            )
+        if not self.llm.available:
+            return ToolRun(
+                summary="qwen search skipped: LLM unavailable",
+                success=False,
+                errors=["LLM unavailable for qwen search"],
+            )
+
+        response = self.llm.search_chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是一个电子工程联网搜索助手。根据用户的搜索查询，"
+                        "利用联网搜索能力查找最新的技术资料、数据手册、规格书、"
+                        "电路设计参考、故障分析案例等信息。"
+                        "返回搜索到的关键技术信息，包括来源URL、关键技术参数和要点摘要。"
+                        "用中文回答，保留原始技术术语和型号。"
+                    ),
+                },
+                {"role": "user", "content": f"请搜索以下技术问题的相关资料：{query}"},
+            ],
+            temperature=0.1,
+        )
+        if not response.content:
+            return ToolRun(
+                [],
+                summary=f"qwen search returned empty for query={query}",
+                success=False,
+                errors=[response.error or "empty qwen search response"],
+                metadata={"query": query},
+            )
+
+        evidence = Evidence(
+            source="qwen_search",
+            title=f"Qwen联网搜索: {query}",
+            content=compact_text(response.content, 5000),
+            metadata={
+                "kind": "web_search_result",
+                "provider": "qwen_search",
+                "query": query,
+            },
+        )
+        return ToolRun(
+            [evidence],
+            summary=f"qwen search returned results for query={query}",
+            metadata={"query": query, "token_usage": response.token_usage},
+        )
+
+
 def _trusted_source(source: str) -> bool:
     """Return True for known high-quality electronics domains."""
     TRUSTED_DOMAINS = {
@@ -935,6 +1027,21 @@ class WebSearchTool(ToolDefinition[WebSearchAction, EvidenceObservation]):
             cls(
                 description="搜索公开网页资料，优先使用已配置的搜索接口，必要时回退到网页搜索。",
                 action_type=WebSearchAction,
+                observation_type=EvidenceObservation,
+                annotations=_readonly_annotations(open_world=True),
+                executor=executor,
+            )
+        ]
+
+
+class QwenSearchTool(ToolDefinition[QwenSearchAction, EvidenceObservation]):
+    @classmethod
+    def create(cls, *args: Any, **kwargs: Any) -> Sequence["QwenSearchTool"]:
+        executor = kwargs["executor"]
+        return [
+            cls(
+                description="使用模型内置联网搜索能力，自动检索最新技术资料、数据手册和故障案例。",
+                action_type=QwenSearchAction,
                 observation_type=EvidenceObservation,
                 annotations=_readonly_annotations(open_world=True),
                 executor=executor,

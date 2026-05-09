@@ -48,6 +48,12 @@ def planner_guidance(enabled_tool_names: list[str] | None = None) -> str:
         if "web_search" in enabled
         else "本轮 web_search/web_read 不可用，不要选择联网工具。"
     )
+    qwen_search_note = (
+        "qwen_search 使用模型内置联网搜索能力，可自动检索最新技术资料和数据手册；"
+        "当需要实时网络信息或常规搜索不足时优先使用。"
+        if "qwen_search" in enabled
+        else ""
+    )
     return (
         "先判断当前答案还缺什么证据，再选择一个最高价值工具；每次只补一个缺口。"
         "有图片且尚未检查时优先 inspect_image；"
@@ -55,6 +61,7 @@ def planner_guidance(enabled_tool_names: list[str] | None = None) -> str:
         f"{local_note}"
         "不要为已有证据覆盖的点重复搜索。"
         f"{web_note}"
+        f"{qwen_search_note}"
         "如果 review_evidence 指出缺少图片、元件、原因或处理建议，下一步应补对应证据。"
         "finish_answer 只能在题面、图片、领域或网页证据已经足够，或者预算/连续错误让继续执行价值很低时使用；"
         "证据不足时必须在最终答案中保留不确定性。"

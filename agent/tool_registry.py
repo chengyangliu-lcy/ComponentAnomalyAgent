@@ -78,6 +78,11 @@ class ToolRegistry:
         return [f"- {spec.planner_name}：{spec.description}" for spec in self._specs.values()]
 
 
+def _qwen_search_enabled(agent_cfg: dict[str, Any], web_cfg: dict[str, Any]) -> bool:
+    _ = web_cfg
+    return bool(agent_cfg.get("enable_qwen_search", False))
+
+
 def _web_search_enabled(agent_cfg: dict[str, Any], web_cfg: dict[str, Any]) -> bool:
     _ = web_cfg
     return bool(agent_cfg.get("enable_web_search", True))
@@ -145,6 +150,20 @@ def build_default_registry() -> ToolRegistry:
                 budget_keys=("max_local_chunks",),
                 recoverable_by_default=True,
                 enabled_predicate=_local_retrieval_enabled,
+            ),
+            ToolSpec(
+                name="qwen_search",
+                planner_name="qwen_search",
+                event_tool_name="qwen_search",
+                event_action_name="qwen_internet_search",
+                description="使用模型内置联网搜索能力，自动检索最新技术资料、数据手册和故障案例。适用于需要实时网络信息的场景。",
+                args_schema={
+                    "query": ToolArgSpec("string", required=True),
+                },
+                defaults={},
+                budget_keys=("max_qwen_search_calls",),
+                recoverable_by_default=True,
+                enabled_predicate=_qwen_search_enabled,
             ),
             ToolSpec(
                 name="web_search",

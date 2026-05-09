@@ -22,6 +22,8 @@ from tools.evidence_tools import (
     ImageInspectAction,
     ImageInspectExecutor,
     LocalRetrieveExecutor,
+    QwenSearchAction,
+    QwenSearchExecutor,
     RobustWebReadExecutor,
     ToolRun,
     build_seed_queries,
@@ -183,6 +185,10 @@ class OpenHandsEvidenceRuntime:
             openhands_browser_require_installed=bool(self.agent_cfg.get("openhands_browser_require_installed", True)),
         )
         self.rank_tool = EvidenceRankExecutor()
+        self.qwen_search_tool = QwenSearchExecutor(
+            self.llm,
+            enabled=bool(self.agent_cfg.get("enable_qwen_search", False)),
+        )
         self.finish_tool = FinishAnswerExecutor(
             self.answer_llm,
             has_local_retrieval=bool(self.agent_cfg.get("enable_local_retrieval", False)),
@@ -514,6 +520,14 @@ class OpenHandsEvidenceRuntime:
                 query,
                 limit=int(action.args.get("limit") or self.agent_cfg.get("max_local_chunks", self.agent_cfg.get("max_local_docs", 4))),
             )
+        if action.tool_name == "qwen_search":
+            if not bool(self.agent_cfg.get("enable_qwen_search", False)):
+                return ToolRun(summary="qwen search disabled by config", success=False, errors=["qwen search disabled"])
+            query = str(action.args.get("query") or "").strip()
+            if not query:
+                return ToolRun(summary="qwen search skipped: no query", success=False, errors=["no qwen search query"])
+            state.queries.append(query)
+            return self.qwen_search_tool.run(query)
         if action.tool_name == "web_search":
             if not bool(self.agent_cfg.get("enable_web_search", True)):
                 return ToolRun(summary="web search disabled by config", success=False, errors=["web search disabled"])
@@ -577,6 +591,10 @@ class OpenHandsEvidenceRuntime:
             max_attempts = int(self.agent_cfg.get("max_local_retrieval_calls", 1))
             if state.tool_counts.get("local_retrieve", 0) >= max_attempts:
                 return "local_retrieve query budget exhausted"
+        if action.tool_name == "qwen_search":
+            max_calls = int(self.agent_cfg.get("max_qwen_search_calls", 2))
+            if state.tool_counts.get("qwen_search", 0) >= max_calls:
+                return "qwen_search call budget exhausted"
         if action.tool_name == "web_search":
             max_queries = int(self.agent_cfg.get("max_web_queries", 3))
             if state.tool_counts.get("web_search", 0) >= max_queries:
@@ -623,6 +641,17 @@ class OpenHandsEvidenceRuntime:
                 "web_search",
                 args={"query": self._next_seed_query(state)},
                 reason="fallback: search public evidence",
+            )
+        max_qwen_calls = int(self.agent_cfg.get("max_qwen_search_calls", 2))
+        if (
+            bool(self.agent_cfg.get("enable_qwen_search", False))
+            and state.tool_counts.get("qwen_search", 0) < max_qwen_calls
+            and self._next_seed_query(state)
+        ):
+            return AgentAction(
+                "qwen_search",
+                args={"query": self._next_seed_query(state)},
+                reason="fallback: qwen built-in search for public evidence",
             )
         max_pages = int(self.web_cfg.get("max_pages_to_read", self.agent_cfg.get("max_web_pages_to_read", 1)))
         if state.tool_counts.get("web_read", 0) < max_pages and self._select_read_target(state, "") is not None:
@@ -915,6 +944,13 @@ class OpenHandsEvidenceRuntime:
                 {
                     "query": sanitized_args.get("query") or (state.queries[-1] if state.queries else ""),
                     "limit": sanitized_args.get("limit"),
+                }
+            )
+            return inputs
+        if action.tool_name == "qwen_search":
+            inputs.update(
+                {
+                    "query": sanitized_args.get("query") or (state.queries[-1] if state.queries else ""),
                 }
             )
             return inputs
