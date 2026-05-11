@@ -68,9 +68,9 @@ agent:
   use_images: true
   send_images_to_llm: true
   enable_image_inspection_llm: true
-  image_inspection_max_tokens: 1500
+  image_inspection_max_tokens: 2500
   max_llm_images: 4
-  max_image_inspect_attempts: 1
+  max_image_inspect_attempts: 2
   image_payload_format: openai_image_url
   image_max_side: 1280
   image_jpeg_quality: 75

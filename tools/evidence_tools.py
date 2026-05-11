@@ -841,6 +841,7 @@ class FinishAnswerExecutor(BaseEvidenceExecutor):
                     },
                 ],
                 temperature=0.1,
+                max_tokens=4000,
             )
             if response.content:
                 sanitized = self._sanitize_answer(response.content, question, compact_evidence)

@@ -25,6 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-web", action="store_true")
     parser.add_argument("--disable-web", action="store_true")
     parser.add_argument("--baseline-eval", default=None)
+    parser.add_argument("--no-resume", action="store_true", help="Disable resume; re-run all stages from scratch.")
     return parser.parse_args()
 
 
@@ -38,6 +39,13 @@ def _read_jsonl(path: Path) -> list[dict]:
         return []
     with path.open("r", encoding="utf-8") as f:
         return [json.loads(line) for line in f if line.strip()]
+
+
+def _count_jsonl_rows(path: Path) -> int:
+    if not path.exists():
+        return 0
+    with path.open("r", encoding="utf-8") as f:
+        return sum(1 for line in f if line.strip())
 
 
 def main() -> None:
@@ -57,14 +65,26 @@ def main() -> None:
         infer_cmd.append("--enable-web")
     if args.disable_web:
         infer_cmd.append("--disable-web")
-    _run(infer_cmd)
+    if args.no_resume:
+        infer_cmd.append("--no-resume")
+    pred_count = _count_jsonl_rows(predictions)
+    if not args.no_resume and pred_count > 0:
+        print(f"[experiment] predictions.jsonl already has {pred_count} rows, skipping inference (use --no-resume to force)")
+    else:
+        _run(infer_cmd)
     eval_cmd = [sys.executable, "scripts/run_eval.py", "--experiment", args.experiment, "--predictions", str(predictions)]
     if args.config:
         eval_cmd.extend(["--config", args.config])
     eval_workers = args.eval_max_workers or args.max_workers
     if eval_workers is not None:
         eval_cmd.extend(["--max-workers", str(eval_workers)])
-    _run(eval_cmd)
+    if args.no_resume:
+        eval_cmd.append("--no-resume")
+    eval_count = _count_jsonl_rows(eval_results)
+    if not args.no_resume and eval_count > 0:
+        print(f"[experiment] eval_results.jsonl already has {eval_count} rows, skipping evaluation (use --no-resume to force)")
+    else:
+        _run(eval_cmd)
     if args.baseline_eval:
         baseline_rows = _read_jsonl(Path(args.baseline_eval))
         agent_rows = _read_jsonl(eval_results)

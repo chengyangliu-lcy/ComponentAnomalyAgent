@@ -35,18 +35,18 @@ def planner_guidance(enabled_tool_names: list[str] | None = None) -> str:
         "当题面包含明确型号、位号、数值、拓扑词或故障症状时优先使用。"
         "由于本地库主要是英文，调用时要改写成英文电子关键词，并保留型号、位号和数值。"
         if "local_retrieve" in enabled
-        else "本轮 local_retrieve 不可用，不要选择本地知识库工具。"
+        else ""
     )
     domain_note = (
         "题目涉及通用电路机制时用 match_domain_skill。"
         if "match_domain_skill" in enabled
-        else "本轮 match_domain_skill 不可用，不要选择领域技能工具。"
+        else ""
     )
     web_note = (
         "web_search 只在 KB 证据不足、需要型号/手册、拓扑规则或通用原理证据时使用，查询词必须包含题面中的元件、型号、数值、拓扑词和异常现象。"
         "web_read 只读一个最有价值且未读过的网址。"
         if "web_search" in enabled
-        else "本轮 web_search/web_read 不可用，不要选择联网工具。"
+        else ""
     )
     qwen_search_note = (
         "qwen_search 使用模型内置联网搜索能力，可自动检索最新技术资料和数据手册；"

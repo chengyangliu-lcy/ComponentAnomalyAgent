@@ -52,6 +52,7 @@ class LLMClient:
         messages: List[Dict[str, Any]],
         temperature: float | None = None,
         response_format: Dict[str, Any] | None = None,
+        max_tokens: int | None = None,
     ) -> LLMResponse:
         if not self._client:
             return LLMResponse(
@@ -64,7 +65,7 @@ class LLMClient:
                 "model": self.model,
                 "messages": messages,
                 "temperature": self.temperature if temperature is None else temperature,
-                "max_tokens": self.max_tokens,
+                "max_tokens": max_tokens if max_tokens is not None else self.max_tokens,
             }
             if response_format:
                 payload["response_format"] = response_format

@@ -19,7 +19,7 @@ from configs.config import load_config
 from evaluator.evaluate import Evaluator
 from evaluator.report import build_error_analysis, summarize_scores
 from tools.dataset_parser import DatasetParser
-from tools.utils import append_jsonl, write_json
+from tools.utils import append_jsonl, read_jsonl, write_json
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
         default="composite",
         help="composite: unified LLM Judge plus local metrics; local-only: local metrics without LLM calls.",
     )
+    parser.add_argument("--no-resume", action="store_true", help="Delete existing eval results and re-evaluate all samples.")
     return parser.parse_args()
 
 
@@ -53,16 +54,26 @@ def main() -> None:
         predictions = predictions[: args.limit]
     default_name = "eval_results.jsonl"
     output_path = Path(args.output) if args.output else config.outputs_dir / args.experiment / default_name
-    if output_path.exists():
+    seen = set()
+    if output_path.exists() and args.no_resume:
         output_path.unlink()
+    if output_path.exists() and not args.no_resume:
+        with output_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    seen.add(json.loads(line)["sample_id"])
     print(
         f"[eval] experiment={args.experiment} mode={args.mode} "
         f"predictions={len(predictions)} output={output_path}"
     )
     eval_items = []
     skipped = 0
+    seen_count = 0
     for pred in predictions:
         sample_id = str(pred.get("sample_id"))
+        if sample_id in seen:
+            seen_count += 1
+            continue
         sample = dataset.get(sample_id)
         if not sample:
             skipped += 1
@@ -73,7 +84,7 @@ def main() -> None:
 
     rows = []
     max_workers = max(1, int(args.max_workers or config.raw.get("runtime", {}).get("max_workers", 1)))
-    print(f"[eval] pending={len(eval_items)} skipped={skipped} max_workers={max_workers}")
+    print(f"[eval] pending={len(eval_items)} skipped={skipped} resumed={seen_count} max_workers={max_workers}")
     start = time.perf_counter()
     use_llm_judge = args.mode != "local-only"
     if max_workers == 1:
@@ -110,18 +121,19 @@ def main() -> None:
 
     eval_cfg = config.raw.get("evaluation", {})
     _remove_stale_summary(config.outputs_dir / args.experiment / "agent_score.json")
+    all_rows = list(read_jsonl(output_path))
     write_json(
         config.outputs_dir / args.experiment / "evaluation_summary.json",
         summarize_scores(
-            rows,
+            all_rows,
             final_weights=eval_cfg.get("final_weights"),
             predictions=predictions,
         ),
     )
-    write_json(config.outputs_dir / args.experiment / "error_analysis.json", build_error_analysis(rows))
+    write_json(config.outputs_dir / args.experiment / "error_analysis.json", build_error_analysis(all_rows))
     elapsed = time.perf_counter() - start
     print(
-        f"[eval] finished evaluated={len(rows)} skipped={skipped} "
+        f"[eval] finished evaluated={len(all_rows)} new={len(rows)} skipped={skipped} resumed={seen_count} "
         f"max_workers={max_workers} elapsed={elapsed:.2f}s wrote={output_path}"
     )
 

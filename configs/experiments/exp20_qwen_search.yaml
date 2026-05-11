@@ -1,0 +1,23 @@
+# Exp20: exp19 baseline + Qwen native search (replace web_search)
+paths:
+  local_kb_index: knowledge_base/circuit_diagnosis_fts_hq_v3
+
+agent:
+  enable_local_retrieval: false
+  max_local_retrieval_calls: 0
+  max_local_docs: 4
+  max_local_chunks: 6
+  enable_web_search: false
+  enable_qwen_search: true
+  max_qwen_search_calls: 2
+  max_total_seconds: 900
+  final_answer_timeout_seconds: 120
+
+retrieval:
+  embedding_model: 'Qwen/Qwen3-Embedding-4B'
+  dense_weight: 0.65
+  sparse_weight: 0.35
+  device: cuda
+  embedding_batch_size: 64
+  enable_llm_query_rewriting: true
+  enable_cross_encoder_rerank: false
