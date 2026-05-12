@@ -188,6 +188,7 @@ class OpenHandsEvidenceRuntime:
         self.qwen_search_tool = QwenSearchExecutor(
             self.llm,
             enabled=bool(self.agent_cfg.get("enable_qwen_search", False)),
+            search_options=dict(self.agent_cfg.get("qwen_search_options") or {}),
         )
         self.finish_tool = FinishAnswerExecutor(
             self.answer_llm,
@@ -207,7 +208,8 @@ class OpenHandsEvidenceRuntime:
             question_type=self._classify(sample.question_text),
             needs_images=bool(image_paths) and bool(self.agent_cfg.get("use_images", True)),
             needs_local_retrieval="local_retrieve" in self.enabled_tool_names,
-            needs_web_search=bool(self.agent_cfg.get("enable_web_search", True)),
+            needs_web_search=bool(self.agent_cfg.get("enable_web_search", True))
+            or bool(self.agent_cfg.get("enable_qwen_search", False)),
             queries=[],
             steps=[],
             strategy="agentic_tool_loop",
@@ -353,10 +355,18 @@ class OpenHandsEvidenceRuntime:
                 f"iterations={state.iteration}; evidence={len(state.evidence)}; stop={state.final_stop_reason}"
             ),
             elapsed_seconds=round(elapsed_total, 4),
-            token_usage={},
+            token_usage=self._aggregate_token_usage(),
             errors=list(dict.fromkeys(error for error in state.errors if error and "LLM unavailable" not in error)),
             plan=plan,
         )
+
+    def _aggregate_token_usage(self) -> Dict[str, Any]:
+        totals: Dict[str, int] = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        for client in (self.llm, self.answer_llm, self.image_llm):
+            usage = client.cumulative_usage
+            for key in totals:
+                totals[key] += usage.get(key, 0)
+        return totals
 
     def _next_action(
         self,

@@ -98,7 +98,8 @@ class AgentPipeline:
             evidence.extend(self.executor.execute(sample, plan, trace))
             enough, reflection_summary, missing = self.reflector.assess(sample, plan, evidence)
             rounds += 1
-        answer, synth_summary, token_usage, synth_errors = self.synthesizer.synthesize(sample, evidence)
+        answer, synth_summary, _single_usage, synth_errors = self.synthesizer.synthesize(sample, evidence)
+        token_usage = self.synthesizer.llm.cumulative_usage
         errors.extend(error for error in synth_errors if error)
         elapsed = time.perf_counter() - start
         return InferenceResult(

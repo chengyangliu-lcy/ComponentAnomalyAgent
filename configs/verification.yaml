@@ -1,0 +1,41 @@
+# Verification configuration
+# Thresholds and settings for experiment verification
+
+comparison:
+  # Minimum improvement to count as a real improvement (1%)
+  improvement_threshold: 0.01
+  # Maximum regression before failing verification (2%)
+  regression_threshold: 0.02
+  # Fail verification if significant regressions found
+  fail_on_regression: true
+  # Metrics to compare
+  metrics:
+    - final_score
+    - llm_judge
+    - semantic_similarity
+    - scoring_point_coverage
+    - claim_rouge_l
+    - technical_entity_match
+
+ablation:
+  enabled: true
+  # Component weights (should match evaluate.py)
+  weights:
+    llm_judge: 0.45
+    structured_point_coverage: 0.25
+    semantic_similarity: 0.20
+    claim_rouge_l: 0.05
+    technical_entity_match: 0.05
+
+failure_analysis:
+  enabled: true
+  # Score below this is considered a failure
+  score_threshold: 0.4
+  # Score below this is considered a critical failure
+  critical_threshold: 0.2
+  # Minimum samples to form a category
+  min_category_size: 3
+
+output:
+  # Default report path (overridable via CLI)
+  report_path: outputs/verification_report.json

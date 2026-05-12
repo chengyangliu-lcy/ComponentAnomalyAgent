@@ -42,6 +42,25 @@ class LLMClient:
             if api_key
             else None
         )
+        self._total_calls: int = 0
+        self._total_prompt_tokens: int = 0
+        self._total_completion_tokens: int = 0
+        self._total_tokens: int = 0
+
+    def _accumulate(self, token_usage: Dict[str, Any]) -> None:
+        self._total_calls += 1
+        self._total_prompt_tokens += int(token_usage.get("prompt_tokens", 0))
+        self._total_completion_tokens += int(token_usage.get("completion_tokens", 0))
+        self._total_tokens += int(token_usage.get("total_tokens", 0))
+
+    @property
+    def cumulative_usage(self) -> Dict[str, Any]:
+        return {
+            "calls": self._total_calls,
+            "prompt_tokens": self._total_prompt_tokens,
+            "completion_tokens": self._total_completion_tokens,
+            "total_tokens": self._total_tokens,
+        }
 
     @property
     def available(self) -> bool:
@@ -74,6 +93,7 @@ class LLMClient:
             response = self._client.chat.completions.create(**payload)
             usage = getattr(response, "usage", None)
             token_usage = usage.model_dump() if hasattr(usage, "model_dump") else {}
+            self._accumulate(token_usage)
             return LLMResponse(
                 content=(response.choices[0].message.content or "").strip(),
                 token_usage=token_usage,
@@ -87,6 +107,7 @@ class LLMClient:
         temperature: float | None = None,
         timeout: float | None = None,
         max_tokens: int | None = None,
+        search_options: Dict[str, Any] | None = None,
     ) -> LLMResponse:
         """Call the LLM with DashScope's built-in internet search enabled.
 
@@ -110,6 +131,11 @@ class LLMClient:
         try:
             search_extra_body = dict(self.extra_body)
             search_extra_body["enable_search"] = True
+            if search_options:
+                search_extra_body["search_options"] = {
+                    **dict(search_extra_body.get("search_options") or {}),
+                    **dict(search_options),
+                }
             payload: Dict[str, Any] = {
                 "model": self.model,
                 "messages": messages,
@@ -122,6 +148,7 @@ class LLMClient:
             response = self._client.chat.completions.create(**payload)
             usage = getattr(response, "usage", None)
             token_usage = usage.model_dump() if hasattr(usage, "model_dump") else {}
+            self._accumulate(token_usage)
             return LLMResponse(
                 content=(response.choices[0].message.content or "").strip(),
                 token_usage=token_usage,

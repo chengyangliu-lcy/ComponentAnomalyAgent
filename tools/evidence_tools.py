@@ -666,9 +666,10 @@ class QwenSearchExecutor(BaseEvidenceExecutor):
     tool_name = "qwen_search"
     action_name = "qwen_internet_search"
 
-    def __init__(self, llm: LLMClient, enabled: bool = True) -> None:
+    def __init__(self, llm: LLMClient, enabled: bool = True, search_options: dict[str, Any] | None = None) -> None:
         self.llm = llm
         self.enabled = enabled
+        self.search_options = dict(search_options or {})
 
     def __call__(self, action: QwenSearchAction, conversation: Any = None) -> EvidenceObservation:
         run = self.run(action.query)
@@ -715,6 +716,7 @@ class QwenSearchExecutor(BaseEvidenceExecutor):
                 {"role": "user", "content": f"请搜索以下技术问题的相关资料：{query}"},
             ],
             temperature=0.1,
+            search_options=self.search_options or None,
         )
         if not response.content:
             return ToolRun(
@@ -733,12 +735,19 @@ class QwenSearchExecutor(BaseEvidenceExecutor):
                 "kind": "web_search_result",
                 "provider": "qwen_search",
                 "query": query,
+                "search_options": dict(self.search_options),
+                "forced_search": bool(self.search_options.get("forced_search")),
             },
         )
         return ToolRun(
             [evidence],
             summary=f"qwen search returned results for query={query}",
-            metadata={"query": query, "token_usage": response.token_usage},
+            metadata={
+                "query": query,
+                "token_usage": response.token_usage,
+                "search_options": dict(self.search_options),
+                "forced_search": bool(self.search_options.get("forced_search")),
+            },
         )
 
 
@@ -1299,6 +1308,5 @@ def _compress_boilerplate(text: str, max_chars: int = 600) -> str:
         else:
             break
     return " ".join(result_lines)
-
 
 

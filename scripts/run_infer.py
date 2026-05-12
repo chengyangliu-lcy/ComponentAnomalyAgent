@@ -167,6 +167,20 @@ def main() -> None:
                 progress.update(1)
         progress.close()
     elapsed = time.perf_counter() - start
+    # Aggregate token usage from all completed samples
+    total_tokens_all = 0
+    total_prompt_all = 0
+    total_completion_all = 0
+    total_calls_all = 0
+    if output_path.exists():
+        with output_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    u = json.loads(line).get("token_usage", {})
+                    total_tokens_all += u.get("total_tokens", 0)
+                    total_prompt_all += u.get("prompt_tokens", 0)
+                    total_completion_all += u.get("completion_tokens", 0)
+                    total_calls_all += u.get("calls", 0)
     write_json(
         summary_path,
         {
@@ -183,7 +197,17 @@ def main() -> None:
             "web_enabled": bool(config.raw.get("agent", {}).get("enable_web_search")),
             "max_workers": max_workers,
             "elapsed_seconds": round(elapsed, 4),
+            "token_usage": {
+                "llm_calls": total_calls_all,
+                "prompt_tokens": total_prompt_all,
+                "completion_tokens": total_completion_all,
+                "total_tokens": total_tokens_all,
+            },
         },
+    )
+    print(
+        f"[infer] tokens total={total_tokens_all} prompt={total_prompt_all} "
+        f"completion={total_completion_all} llm_calls={total_calls_all}"
     )
     print(
         f"[infer] finished completed={completed} failed={hard_failed} warnings={warning_samples} skipped={skipped} "
@@ -350,17 +374,21 @@ def _update_progress(progress: tqdm, row: dict[str, Any]) -> None:
     tools = row.get("tools_used", [])
     elapsed = float(row.get("elapsed_seconds", 0.0) or 0.0)
     errors = row.get("errors", [])
+    usage = row.get("token_usage", {})
+    tokens = usage.get("total_tokens", 0)
     progress.set_postfix(
         {
             "id": sample_id,
             "tools": len(tools),
             "sec": f"{elapsed:.1f}",
             "err": len(errors),
+            "tok": tokens,
         }
     )
     tqdm.write(
         f"[infer] done sample_id={sample_id} tools={tools} "
-        f"web={row.get('web_searched')} elapsed={elapsed:.2f}s errors={len(errors)}"
+        f"web={row.get('web_searched')} elapsed={elapsed:.2f}s errors={len(errors)} "
+        f"tokens={tokens} (prompt={usage.get('prompt_tokens', 0)} completion={usage.get('completion_tokens', 0)})"
     )
 
 

@@ -123,6 +123,16 @@ class AgenticRuntimeTests(unittest.TestCase):
             self.assertIn("local_retrieve", runtime.planner_system_prompt)
             self.assertTrue(runtime.local_kb_status.usable)
 
+    def test_qwen_search_options_are_passed_to_runtime_tool(self) -> None:
+        with self._runtime(
+            agent_overrides={
+                "enable_qwen_search": True,
+                "qwen_search_options": {"forced_search": True},
+            }
+        ) as runtime:
+            self.assertIn("qwen_search", runtime.enabled_tool_names)
+            self.assertEqual(runtime.qwen_search_tool.search_options, {"forced_search": True})
+
     def test_scripted_valid_actions_drive_loop(self) -> None:
         with self._runtime() as runtime:
             runtime.llm = ScriptedPlanner(

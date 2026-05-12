@@ -17,6 +17,7 @@ from tools.evidence_tools import (
     FinishAnswerExecutor,
     ImageInspectAction,
     ImageInspectExecutor,
+    QwenSearchExecutor,
     RobustWebReadExecutor,
 )
 
@@ -40,6 +41,17 @@ class CaptureLLM:
     def chat(self, messages, temperature=None):
         self.messages = messages
         return SimpleNamespace(content="结论：测试答案", error=None)
+
+
+class CaptureSearchLLM:
+    available = True
+
+    def __init__(self) -> None:
+        self.search_options = None
+
+    def search_chat(self, messages, temperature=None, search_options=None):
+        self.search_options = search_options
+        return SimpleNamespace(content="搜索结果摘要", error=None, token_usage={"total_tokens": 12})
 
 
 class FakeBrowser:
@@ -270,6 +282,17 @@ class EvidenceToolTests(unittest.TestCase):
         self.assertTrue(run.success)
         self.assertTrue(all("expected_terms" not in item.metadata for item in run.evidence))
         self.assertTrue(any(item.source.startswith("domain_skill:") for item in run.evidence))
+
+    def test_qwen_search_passes_forced_search_options_to_llm(self) -> None:
+        llm = CaptureSearchLLM()
+        executor = QwenSearchExecutor(llm, enabled=True, search_options={"forced_search": True})
+
+        run = executor.run("TL431 feedback abnormal")
+
+        self.assertTrue(run.success)
+        self.assertEqual(llm.search_options, {"forced_search": True})
+        self.assertEqual(run.evidence[0].metadata["search_options"], {"forced_search": True})
+        self.assertTrue(run.evidence[0].metadata["forced_search"])
 
     def test_finish_answer_compacts_and_deduplicates_evidence(self) -> None:
         llm = CaptureLLM()
