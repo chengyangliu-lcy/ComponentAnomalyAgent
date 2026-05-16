@@ -5,7 +5,8 @@ from io import BytesIO
 import json
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -13,6 +14,7 @@ from urllib.parse import urlparse
 
 import requests
 import yaml
+from bs4 import BeautifulSoup
 from pydantic import Field
 
 from agent.prompts import (
@@ -23,10 +25,14 @@ from agent.prompts import (
 )
 from llm_client import LLMClient
 from schemas import Evidence, StandardSample, ToolEvent
+from tools.browser import BrowserFallback
+from tools.content_extractor import ExtractedContent, extract_llm_markdown
 from tools.utils import compact_text, timer
 from tools.web_reader import WebReader
 from tools.web_search import WebSearch
 from tools.openhands_browser import OpenHandsBrowserConfig, OpenHandsBrowserFetcher
+from tools.crawl4ai_fetcher import Crawl4AIConfig, Crawl4AIFetcher
+from tools.scrapling_fetcher import ScraplingConfig, ScraplingFetcher
 from tools.circuit_kb import (
     CircuitMarkdownRetriever,
     classify_query_terms,
@@ -34,6 +40,86 @@ from tools.circuit_kb import (
     is_circuitmaker_project_source,
     is_low_value_source,
 )
+
+_LOW_VALUE_SEARCH_HOSTS = {
+    "www.douyin.com",
+    "douyin.com",
+    "www.xueshu.com",
+    "xueshu.com",
+    "www.rcmoy.com",
+    "rcmoy.com",
+    "www.scribd.com",
+    "scribd.com",
+    "www.taobao.com",
+    "taobao.com",
+    "detail.tmall.com",
+    "www.tmall.com",
+    "www.jd.com",
+    "jd.com",
+    "item.jd.com",
+    "www.amazon.com",
+    "amazon.com",
+}
+
+_LOW_VALUE_SEARCH_PATH_MARKERS = (
+    "/search/",
+    "/sitemap",
+    "sitemap.",
+    "/tag/",
+    "/tags/",
+    "/tag_",
+)
+
+_LOW_VALUE_SEARCH_TITLE_MARKERS = (
+    "网站地图",
+    "站点地图",
+    "sitemap",
+    "搜索",
+    "抖音",
+    "快手",
+    "淘宝",
+    "天猫",
+    "好货",
+    "店铺",
+    "通用",
+    "12篇",
+    "范文",
+)
+
+_SEARCH_STOP_TERMS = {
+    "怎么",
+    "为什么",
+    "什么",
+    "问题",
+    "原因",
+    "处理",
+    "维修",
+    "电路",
+    "使用",
+    "指南",
+    "设计",
+    "拆解",
+    "内部",
+}
+
+_WEB_READ_NAV_WORDS = {
+    "home",
+    "products",
+    "product",
+    "solutions",
+    "support",
+    "resources",
+    "applications",
+    "company",
+    "about",
+    "login",
+    "register",
+    "cart",
+    "menu",
+    "search",
+    "forum",
+    "download",
+}
 
 try:
     os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
@@ -120,6 +206,16 @@ class ToolRun:
     success: bool = True
     errors: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class WebReadCandidate:
+    backend: str
+    evidence: Evidence | None = None
+    error: str = ""
+    elapsed_seconds: float = 0.0
+    final_score: float = 0.0
+    selection_reason: str = ""
 
 
 class BaseEvidenceExecutor(ToolExecutor):
@@ -258,11 +354,13 @@ class APIWebSearchExecutor(BaseEvidenceExecutor):
         api_keys: dict[str, str] | None = None,
         timeout: int = 20,
         html_provider: str = "duckduckgo",
+        searxng_url: str = "",
     ) -> None:
         self.provider_order = list(provider_order or ["html"])
         self.api_key_envs = dict(api_key_envs or {})
         self.api_keys = {key.lower(): value for key, value in dict(api_keys or {}).items() if value}
         self.timeout = timeout
+        self.searxng_url = searxng_url.rstrip("/") if searxng_url else ""
         self.html_search = WebSearch(timeout=timeout, provider=html_provider)
         self.session = requests.Session()
         self.session.headers.update(
@@ -288,6 +386,7 @@ class APIWebSearchExecutor(BaseEvidenceExecutor):
             provider = provider.lower().strip()
             if provider == "html":
                 results, error = self.html_search.search(query, limit=limit)
+                results = self._rank_and_filter_results(query, results, limit)
                 if results:
                     return ToolRun(
                         results,
@@ -295,6 +394,24 @@ class APIWebSearchExecutor(BaseEvidenceExecutor):
                         metadata={"provider": "html", "query": query},
                     )
                 errors.append(f"html: {error or 'no results'}")
+                continue
+            if provider == "searxng":
+                if not self.searxng_url:
+                    errors.append("searxng: searxng_url not configured")
+                    continue
+                try:
+                    results = self._search_searxng(query, limit)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"searxng: {exc}")
+                    continue
+                results = self._rank_and_filter_results(query, results, limit)
+                if results:
+                    return ToolRun(
+                        results,
+                        summary=f"searxng search returned {len(results)} results",
+                        metadata={"provider": "searxng", "query": query},
+                    )
+                errors.append("searxng: no results")
                 continue
             key_env = self.api_key_envs.get(provider, "")
             api_key = self.api_keys.get(provider) or (os.environ.get(key_env) if key_env else None)
@@ -306,6 +423,7 @@ class APIWebSearchExecutor(BaseEvidenceExecutor):
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{provider}: {exc}")
                 continue
+            results = self._rank_and_filter_results(query, results, limit)
             if results:
                 return ToolRun(
                     results,
@@ -320,6 +438,90 @@ class APIWebSearchExecutor(BaseEvidenceExecutor):
             errors=errors,
             metadata={"query": query, "provider_order": self.provider_order},
         )
+
+    def _search_searxng(self, query: str, limit: int) -> list[Evidence]:
+        json_error: Exception | None = None
+        try:
+            response = self.session.get(
+                f"{self.searxng_url}/search",
+                params={"q": query, "format": "json", "categories": "general"},
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            rows = response.json().get("results", [])
+            results = [
+                _search_evidence(
+                    query,
+                    "searxng",
+                    row.get("title") or row.get("url", ""),
+                    row.get("url", ""),
+                    row.get("content") or "",
+                    float(row.get("score") or 0.0),
+                )
+                for row in rows[: max(limit * 4, limit)]
+                if row.get("url")
+            ]
+            if results:
+                return results
+        except Exception as exc:  # noqa: BLE001
+            json_error = exc
+
+        html_results = self._search_searxng_html(query, limit)
+        if html_results:
+            return html_results
+        if json_error:
+            raise json_error
+        return []
+
+    def _search_searxng_html(self, query: str, limit: int) -> list[Evidence]:
+        response = self.session.get(
+            f"{self.searxng_url}/search",
+            params={"q": query, "categories": "general"},
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        results: list[Evidence] = []
+        for article in soup.select("article.result"):
+            link = article.select_one("h3 a[href]") or article.select_one("a.url_header[href]")
+            if not link:
+                continue
+            url = link.get("href", "")
+            if not url:
+                continue
+            title = link.get_text(" ", strip=True) or url
+            content = ""
+            content_node = article.select_one("p.content")
+            if content_node:
+                content = content_node.get_text(" ", strip=True)
+            if not content:
+                content = article.get_text(" ", strip=True)
+            results.append(_search_evidence(query, "searxng_html", title, url, content, 0.0))
+            if len(results) >= max(limit * 4, limit):
+                break
+        return results
+
+    def _rank_and_filter_results(self, query: str, results: list[Evidence], limit: int) -> list[Evidence]:
+        seen: set[str] = set()
+        scored: list[tuple[float, Evidence]] = []
+        for item in results:
+            normalized = _normalize_search_url(item.source)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            reason = _low_value_search_reason(item)
+            if reason:
+                item.metadata["search_filter_reason"] = reason
+                continue
+            score, reason = _search_relevance_score(query, item)
+            if score <= 0.0:
+                item.metadata["search_filter_reason"] = reason
+                continue
+            item.score = round(score, 4)
+            item.metadata["search_relevance_reason"] = reason
+            scored.append((score, item))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [item for _score, item in scored[:limit]]
 
     def _search_provider(self, provider: str, api_key: str, query: str, limit: int) -> list[Evidence]:
         if provider == "tavily":
@@ -426,6 +628,56 @@ class RobustWebReadExecutor(BaseEvidenceExecutor):
         openhands_browser_max_chars: int = 6000,
         openhands_browser_require_installed: bool = True,
         openhands_browser: Any | None = None,
+        enable_jina_reader: bool = True,
+        jina_max_chars: int = 8000,
+        jina_use_readerlm_fallback: bool = True,
+        jina_min_quality_score: float = 0.55,
+        jina_min_clean_chars: int = 500,
+        enable_content_extraction: bool = True,
+        enable_browser_fallback: bool = False,
+        browser_fallback: Any | None = None,
+        browser_fallback_wait_ms: int = 2500,
+        enable_crawl4ai: bool = True,
+        crawl4ai_timeout_seconds: float = 15.0,
+        crawl4ai_max_chars: int = 6000,
+        crawl4ai_word_count_threshold: int = 10,
+        crawl4ai_use_content_filter: bool = True,
+        crawl4ai_content_filter_type: str = "pruning",
+        crawl4ai_primary: bool = False,
+        crawl4ai_markdown_mode: str = "best",
+        crawl4ai_content_source: str = "best",
+        crawl4ai_enable_stealth: bool = True,
+        crawl4ai_scan_full_page: bool = True,
+        crawl4ai_delay_before_return_html: float = 0.5,
+        crawl4ai_css_selector: str = "",
+        crawl4ai_target_elements: Sequence[str] | None = None,
+        crawl4ai_excluded_selector: str = "",
+        crawl4ai_excluded_tags: Sequence[str] | None = None,
+        crawl4ai_fetcher: Any | None = None,
+        enable_scrapling: bool = False,
+        scrapling_timeout_seconds: float = 15.0,
+        scrapling_max_chars: int = 8000,
+        scrapling_mode: str = "dynamic",
+        scrapling_content_source: str = "html",
+        scrapling_auto_match: bool = True,
+        scrapling_network_idle: bool = True,
+        scrapling_wait_ms: int = 0,
+        scrapling_wait_selector: str = "",
+        scrapling_disable_resources: bool = False,
+        scrapling_block_images: bool = True,
+        scrapling_google_search: bool = True,
+        scrapling_real_chrome: bool = False,
+        scrapling_css_selector: str = "",
+        scrapling_target_elements: Sequence[str] | None = None,
+        scrapling_excluded_selector: str = "",
+        scrapling_excluded_tags: Sequence[str] | None = None,
+        scrapling_fetcher: Any | None = None,
+        web_read_competitive_mode: bool = False,
+        web_read_competitive_timeout_seconds: float | None = None,
+        web_read_min_quality_score: float | None = None,
+        web_read_min_clean_chars: int | None = None,
+        web_read_compare_mode: bool = False,
+        backend_comparison_path: str | None = None,
     ) -> None:
         self.reader = WebReader(timeout=timeout)
         self.enable_openhands_browser_primary = enable_openhands_browser_primary
@@ -437,6 +689,66 @@ class RobustWebReadExecutor(BaseEvidenceExecutor):
                 require_installed=openhands_browser_require_installed,
             )
         )
+        self.enable_jina_reader = enable_jina_reader
+        self.jina_max_chars = jina_max_chars
+        self.jina_use_readerlm_fallback = jina_use_readerlm_fallback
+        self.jina_min_quality_score = jina_min_quality_score
+        self.jina_min_clean_chars = jina_min_clean_chars
+        self.enable_content_extraction = enable_content_extraction
+        self.enable_browser_fallback = enable_browser_fallback
+        self.browser_fallback = browser_fallback or BrowserFallback(
+            timeout_ms=int((openhands_browser_timeout_seconds or timeout) * 1000),
+            wait_after_load_ms=browser_fallback_wait_ms,
+        )
+        self.enable_crawl4ai = enable_crawl4ai
+        self.crawl4ai_primary = crawl4ai_primary
+        self.crawl4ai_max_chars = crawl4ai_max_chars
+        self.crawl4ai_fetcher = crawl4ai_fetcher or Crawl4AIFetcher(
+            Crawl4AIConfig(
+                timeout_seconds=crawl4ai_timeout_seconds,
+                max_chars=crawl4ai_max_chars,
+                word_count_threshold=crawl4ai_word_count_threshold,
+                use_content_filter=crawl4ai_use_content_filter,
+                content_filter_type=crawl4ai_content_filter_type,
+                markdown_mode=crawl4ai_markdown_mode,
+                content_source=crawl4ai_content_source,
+                enable_stealth=crawl4ai_enable_stealth,
+                scan_full_page=crawl4ai_scan_full_page,
+                delay_before_return_html=crawl4ai_delay_before_return_html,
+                css_selector=crawl4ai_css_selector,
+                target_elements=tuple(crawl4ai_target_elements or Crawl4AIConfig().target_elements),
+                excluded_selector=crawl4ai_excluded_selector or Crawl4AIConfig().excluded_selector,
+                excluded_tags=tuple(crawl4ai_excluded_tags or Crawl4AIConfig().excluded_tags),
+            )
+        )
+        self.enable_scrapling = enable_scrapling
+        self.scrapling_max_chars = scrapling_max_chars
+        self.scrapling_fetcher = scrapling_fetcher or ScraplingFetcher(
+            ScraplingConfig(
+                timeout_seconds=scrapling_timeout_seconds,
+                max_chars=scrapling_max_chars,
+                mode=scrapling_mode,
+                content_source=scrapling_content_source,
+                auto_match=scrapling_auto_match,
+                network_idle=scrapling_network_idle,
+                wait_ms=scrapling_wait_ms,
+                wait_selector=scrapling_wait_selector,
+                disable_resources=scrapling_disable_resources,
+                block_images=scrapling_block_images,
+                google_search=scrapling_google_search,
+                real_chrome=scrapling_real_chrome,
+                css_selector=scrapling_css_selector,
+                target_elements=tuple(scrapling_target_elements or ScraplingConfig().target_elements),
+                excluded_selector=scrapling_excluded_selector or ScraplingConfig().excluded_selector,
+                excluded_tags=tuple(scrapling_excluded_tags or ScraplingConfig().excluded_tags),
+            )
+        )
+        self.web_read_competitive_mode = web_read_competitive_mode
+        self.web_read_competitive_timeout_seconds = float(web_read_competitive_timeout_seconds or max(timeout, crawl4ai_timeout_seconds, scrapling_timeout_seconds))
+        self.web_read_min_quality_score = float(web_read_min_quality_score if web_read_min_quality_score is not None else jina_min_quality_score)
+        self.web_read_min_clean_chars = int(web_read_min_clean_chars if web_read_min_clean_chars is not None else min(jina_min_clean_chars, 500))
+        self.web_read_compare_mode = web_read_compare_mode
+        self.backend_comparison_path = backend_comparison_path
 
     def __call__(self, action: WebReadAction, conversation: Any = None) -> EvidenceObservation:
         run = self.run(action.url, action.title, action.snippet)
@@ -453,43 +765,192 @@ class RobustWebReadExecutor(BaseEvidenceExecutor):
             evidence = _search_evidence("", "snippet", title or url, url, snippet, 0.0)
             evidence.metadata["read_skipped"] = "pdf_binary_or_known_slow"
             evidence.metadata["read_backend"] = "snippet_fallback"
+            evidence.metadata["read_confidence"] = "low"
+            evidence.metadata["effective_read_success"] = False
             return ToolRun(
                 [evidence],
                 summary="kept search snippet for pdf/binary/known-slow page",
-                metadata={"read_backend": "snippet_fallback"},
+                metadata={"read_backend": "snippet_fallback", "read_confidence": "low", "effective_read_success": False},
             )
+
+        if self.web_read_compare_mode:
+            return self._run_compare(url, title, snippet)
+
+        if self.web_read_competitive_mode:
+            competitive_run = self._run_competitive(url, title, snippet)
+            if competitive_run:
+                return competitive_run
+
+        crawl4ai_error = None
+        jina_error = None
+        scrapling_error = None
+
+        if self.crawl4ai_primary:
+            crawl4ai_run, crawl4ai_error = self._run_crawl4ai_candidate(url, title, snippet)
+            if crawl4ai_run:
+                return crawl4ai_run
+
+        if self.enable_jina_reader:
+            jina_result = self._fetch_jina(url, title=title, snippet=snippet, max_chars=self.jina_max_chars)
+            if jina_result and jina_result.acceptable(self.jina_min_quality_score, self.jina_min_clean_chars):
+                evidence = self._jina_evidence(url, title, jina_result)
+                if crawl4ai_error:
+                    evidence.metadata["crawl4ai_error"] = crawl4ai_error
+                return ToolRun(
+                    [evidence],
+                    summary=f"read page with Jina Reader {url}",
+                    errors=[error for error in [crawl4ai_error] if error],
+                    metadata={"read_backend": "jina_reader", "crawl4ai_error": crawl4ai_error},
+                )
+            if jina_result:
+                jina_error = (
+                    "jina_reader: low quality "
+                    f"score={jina_result.quality_score:.2f} chars={jina_result.clean_chars} "
+                    f"reason={jina_result.quality_reason}"
+                )
+            else:
+                jina_error = "jina_reader: empty or failed"
+
+        if not self.crawl4ai_primary:
+            crawl4ai_run, crawl4ai_error = self._run_crawl4ai_candidate(url, title, snippet)
+            if crawl4ai_run:
+                if jina_error:
+                    crawl4ai_run.evidence[0].metadata["jina_error"] = jina_error
+                    crawl4ai_run.errors = [error for error in [jina_error] if error]
+                    crawl4ai_run.metadata["jina_error"] = jina_error
+                return crawl4ai_run
+
+        scrapling_run, scrapling_error = self._run_scrapling_candidate(url, title, snippet)
+        if scrapling_run:
+            if jina_error:
+                scrapling_run.evidence[0].metadata["jina_error"] = jina_error
+                scrapling_run.errors = [error for error in [jina_error] if error]
+                scrapling_run.metadata["jina_error"] = jina_error
+            if crawl4ai_error:
+                scrapling_run.evidence[0].metadata["crawl4ai_error"] = crawl4ai_error
+                scrapling_run.metadata["crawl4ai_error"] = crawl4ai_error
+            return scrapling_run
+
+        browser_error = None
+        if self.enable_browser_fallback:
+            browser_result = self.browser_fallback.fetch(url, max_chars=self.openhands_browser_max_chars)
+            if browser_result.evidence:
+                browser_result.evidence.title = title or browser_result.evidence.title or url
+                browser_result.evidence = self._clean_evidence(
+                    browser_result.evidence,
+                    title=browser_result.evidence.title,
+                    snippet=snippet,
+                    max_chars=self.openhands_browser_max_chars,
+                    source_format="text",
+                )
+                browser_result.evidence.metadata["read_backend"] = "playwright_browser"
+                if crawl4ai_error:
+                    browser_result.evidence.metadata["crawl4ai_error"] = crawl4ai_error
+                if jina_error:
+                    browser_result.evidence.metadata["jina_error"] = jina_error
+                if scrapling_error:
+                    browser_result.evidence.metadata["scrapling_error"] = scrapling_error
+                if self._evidence_has_content(browser_result.evidence):
+                    return ToolRun(
+                        [browser_result.evidence],
+                        summary=f"read page with Playwright browser {url}",
+                        errors=[error for error in [crawl4ai_error, jina_error, scrapling_error] if error],
+                        metadata={
+                            "read_backend": "playwright_browser",
+                            "crawl4ai_error": crawl4ai_error,
+                            "jina_error": jina_error,
+                            "scrapling_error": scrapling_error,
+                        },
+                    )
+                browser_error = self._low_quality_evidence_error("playwright_browser", browser_result.evidence)
+            else:
+                browser_error = browser_result.error
 
         openhands_error = None
         if self.enable_openhands_browser_primary:
             browser_result = self.openhands_browser.fetch(url, max_chars=self.openhands_browser_max_chars)
             if browser_result.evidence:
                 browser_result.evidence.title = title or browser_result.evidence.title or url
-                browser_result.evidence.metadata["read_backend"] = "openhands_browser"
-                return ToolRun(
-                    [browser_result.evidence],
-                    summary=f"read page with OpenHands browser {url}",
-                    metadata={"read_backend": "openhands_browser"},
+                browser_result.evidence = self._clean_evidence(
+                    browser_result.evidence,
+                    title=browser_result.evidence.title,
+                    snippet=snippet,
+                    max_chars=self.openhands_browser_max_chars,
+                    source_format="text",
                 )
-            openhands_error = browser_result.error
+                browser_result.evidence.metadata["read_backend"] = "openhands_browser"
+                if crawl4ai_error:
+                    browser_result.evidence.metadata["crawl4ai_error"] = crawl4ai_error
+                if jina_error:
+                    browser_result.evidence.metadata["jina_error"] = jina_error
+                if browser_error:
+                    browser_result.evidence.metadata["browser_fallback_error"] = browser_error
+                if scrapling_error:
+                    browser_result.evidence.metadata["scrapling_error"] = scrapling_error
+                if self._evidence_has_content(browser_result.evidence):
+                    return ToolRun(
+                        [browser_result.evidence],
+                        summary=f"read page with OpenHands browser {url}",
+                        metadata={
+                            "read_backend": "openhands_browser",
+                            "crawl4ai_error": crawl4ai_error,
+                            "jina_error": jina_error,
+                            "scrapling_error": scrapling_error,
+                            "browser_fallback_error": browser_error,
+                        },
+                    )
+                openhands_error = self._low_quality_evidence_error("openhands_browser", browser_result.evidence)
+            else:
+                openhands_error = browser_result.error
 
         page = self.reader.read(url, max_chars=6000)
         if page.evidence:
+            page.evidence = self._clean_evidence(
+                page.evidence,
+                title=page.evidence.title,
+                snippet=snippet,
+                max_chars=6000,
+                source_format="text",
+            )
             page.evidence.metadata["read_backend"] = "requests_bs4"
+            if crawl4ai_error:
+                page.evidence.metadata["crawl4ai_error"] = crawl4ai_error
             if openhands_error:
                 page.evidence.metadata["openhands_error"] = openhands_error
-            return ToolRun(
-                [page.evidence],
-                summary=f"read page {url}",
-                errors=[openhands_error] if openhands_error else [],
-                metadata={"read_backend": "requests_bs4", "openhands_error": openhands_error},
-            )
+            if browser_error:
+                page.evidence.metadata["browser_fallback_error"] = browser_error
+            if jina_error:
+                page.evidence.metadata["jina_error"] = jina_error
+            if scrapling_error:
+                page.evidence.metadata["scrapling_error"] = scrapling_error
+            if self._evidence_has_content(page.evidence):
+                return ToolRun(
+                    [page.evidence],
+                    summary=f"read page {url}",
+                    errors=[error for error in [crawl4ai_error, jina_error, scrapling_error, browser_error, openhands_error] if error],
+                    metadata={
+                        "read_backend": "requests_bs4",
+                        "crawl4ai_error": crawl4ai_error,
+                        "jina_error": jina_error,
+                        "scrapling_error": scrapling_error,
+                        "browser_fallback_error": browser_error,
+                        "openhands_error": openhands_error,
+                    },
+                )
+            page.error = self._low_quality_evidence_error("requests_bs4", page.evidence)
         if snippet:
             evidence = _search_evidence("", "snippet", title or url, url, snippet, 0.0)
             evidence.metadata["read_error"] = page.error
             evidence.metadata["web_reader_error"] = page.error
+            evidence.metadata["crawl4ai_error"] = crawl4ai_error
             evidence.metadata["openhands_error"] = openhands_error
+            evidence.metadata["browser_fallback_error"] = browser_error
+            evidence.metadata["jina_error"] = jina_error
+            evidence.metadata["scrapling_error"] = scrapling_error
             evidence.metadata["read_backend"] = "snippet_fallback"
-            errors = [error for error in [openhands_error, page.error or "read failed"] if error]
+            evidence.metadata["read_confidence"] = "low"
+            evidence.metadata["effective_read_success"] = False
+            errors = [error for error in [crawl4ai_error, jina_error, scrapling_error, browser_error, openhands_error, page.error or "read failed"] if error]
             return ToolRun(
                 [evidence],
                 summary="page read failed; kept search snippet",
@@ -497,11 +958,17 @@ class RobustWebReadExecutor(BaseEvidenceExecutor):
                 errors=errors,
                 metadata={
                     "read_backend": "snippet_fallback",
+                    "crawl4ai_error": crawl4ai_error,
+                    "jina_error": jina_error,
+                    "scrapling_error": scrapling_error,
+                    "browser_fallback_error": browser_error,
                     "openhands_error": openhands_error,
                     "web_reader_error": page.error,
+                    "read_confidence": "low",
+                    "effective_read_success": False,
                 },
             )
-        errors = [error for error in [openhands_error, page.error or "read failed"] if error]
+        errors = [error for error in [crawl4ai_error, jina_error, scrapling_error, browser_error, openhands_error, page.error or "read failed"] if error]
         return ToolRun(
             [],
             summary=f"page read failed {url}",
@@ -509,6 +976,10 @@ class RobustWebReadExecutor(BaseEvidenceExecutor):
             errors=errors,
             metadata={
                 "read_backend": "failed",
+                "crawl4ai_error": crawl4ai_error,
+                "jina_error": jina_error,
+                "scrapling_error": scrapling_error,
+                "browser_fallback_error": browser_error,
                 "openhands_error": openhands_error,
                 "web_reader_error": page.error,
             },
@@ -523,9 +994,646 @@ class RobustWebReadExecutor(BaseEvidenceExecutor):
         )
         return any(marker in lowered_url for marker in slow_or_blocked_hosts)
 
+    def _run_competitive(self, url: str, title: str, snippet: str) -> ToolRun | None:
+        tasks: dict[str, Any] = {}
+        candidates: list[WebReadCandidate] = []
+        completed_order: list[str] = []
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            if self.enable_jina_reader:
+                tasks["jina_reader"] = executor.submit(self._competitive_jina_candidate, url, title, snippet)
+            if self.enable_crawl4ai:
+                tasks["crawl4ai"] = executor.submit(self._competitive_crawl4ai_candidate, url, title, snippet)
+            if self.enable_scrapling:
+                tasks["scrapling_dynamic"] = executor.submit(self._competitive_scrapling_candidate, url, title, snippet)
+
+            future_to_backend = {future: backend for backend, future in tasks.items()}
+            try:
+                for future in as_completed(future_to_backend, timeout=self.web_read_competitive_timeout_seconds):
+                    backend = future_to_backend[future]
+                    completed_order.append(backend)
+                    try:
+                        candidate = future.result()
+                    except Exception as exc:  # noqa: BLE001
+                        candidate = WebReadCandidate(backend=backend, error=f"{backend}: {exc}")
+                    self._score_web_read_candidate(candidate, title=title, snippet=snippet)
+                    candidates.append(candidate)
+            except TimeoutError:
+                for backend, future in tasks.items():
+                    if backend not in completed_order:
+                        future.cancel()
+                        candidates.append(WebReadCandidate(backend=backend, error=f"{backend}: timeout"))
+
+        if not tasks:
+            return None
+
+        usable = [
+            candidate
+            for candidate in candidates
+            if candidate.evidence
+            and candidate.final_score > 0.0
+            and int(candidate.evidence.metadata.get("clean_chars") or len(candidate.evidence.content or "")) > 0
+        ]
+        backend_scores = self._candidate_score_records(candidates)
+        backend_errors = {candidate.backend: candidate.error for candidate in candidates if candidate.error}
+
+        if not usable:
+            self._log_comparison(
+                {
+                    "url": url,
+                    "competitive_mode": True,
+                    "backend_scores": backend_scores,
+                    "backend_errors": backend_errors,
+                    "completed_order": completed_order,
+                    "winner": "none",
+                }
+            )
+            return None
+
+        winner = max(usable, key=lambda item: (item.final_score, self._candidate_purity(item), min(len(item.evidence.content or ""), 12000)))
+        assert winner.evidence is not None
+        winner.evidence.title = title or winner.evidence.title or url
+        winner.evidence.metadata.update(
+            {
+                "read_backend": winner.backend,
+                "competitive_mode": True,
+                "competitive_winner": winner.backend,
+                "competitive_final_score": winner.final_score,
+                "competitive_selection_reason": winner.selection_reason,
+                "backend_scores": backend_scores,
+                "backend_errors": backend_errors,
+                "completed_order": completed_order,
+            }
+        )
+        comparison = {
+            "url": url,
+            "competitive_mode": True,
+            "backend_scores": backend_scores,
+            "backend_errors": backend_errors,
+            "completed_order": completed_order,
+            "winner": winner.backend,
+        }
+        self._log_comparison(comparison)
+        return ToolRun(
+            [winner.evidence],
+            summary=f"competitive read selected {winner.backend} for {url}",
+            errors=list(backend_errors.values()),
+            metadata={
+                "read_backend": winner.backend,
+                "competitive_mode": True,
+                "comparison": comparison,
+            },
+        )
+
+    def _competitive_jina_candidate(self, url: str, title: str, snippet: str) -> WebReadCandidate:
+        start = time.perf_counter()
+        result = self._fetch_jina(url, title=title, snippet=snippet, max_chars=self.jina_max_chars)
+        elapsed = time.perf_counter() - start
+        if not result:
+            return WebReadCandidate("jina_reader", error="jina_reader: empty or failed", elapsed_seconds=elapsed)
+        return WebReadCandidate("jina_reader", evidence=self._jina_evidence(url, title, result), elapsed_seconds=elapsed)
+
+    def _competitive_crawl4ai_candidate(self, url: str, title: str, snippet: str) -> WebReadCandidate:
+        start = time.perf_counter()
+        run, error = self._run_crawl4ai_candidate(url, title, snippet)
+        elapsed = time.perf_counter() - start
+        if run and run.evidence:
+            return WebReadCandidate("crawl4ai", evidence=run.evidence[0], elapsed_seconds=elapsed)
+        return WebReadCandidate("crawl4ai", error=error or "crawl4ai: empty or failed", elapsed_seconds=elapsed)
+
+    def _competitive_scrapling_candidate(self, url: str, title: str, snippet: str) -> WebReadCandidate:
+        start = time.perf_counter()
+        run, error = self._run_scrapling_candidate(url, title, snippet)
+        elapsed = time.perf_counter() - start
+        if run and run.evidence:
+            return WebReadCandidate("scrapling_dynamic", evidence=run.evidence[0], elapsed_seconds=elapsed)
+        return WebReadCandidate("scrapling_dynamic", error=error or "scrapling_dynamic: empty or failed", elapsed_seconds=elapsed)
+
+    def _score_web_read_candidate(self, candidate: WebReadCandidate, *, title: str, snippet: str) -> None:
+        if not candidate.evidence:
+            candidate.final_score = 0.0
+            candidate.selection_reason = candidate.error or "empty"
+            return
+        evidence = candidate.evidence
+        text = evidence.content or ""
+        metadata = evidence.metadata
+        quality_score = float(metadata.get("quality_score") or 0.0)
+        clean_chars = int(metadata.get("clean_chars") or len(text))
+        reason = str(metadata.get("quality_reason") or "")
+        if quality_score <= 0.0 or any(marker in reason for marker in ("blocked_or_failure_page", "empty_after_cleaning", "mojibake_or_wrong_encoding")):
+            candidate.final_score = 0.0
+            candidate.selection_reason = reason or "invalid"
+            return
+        metrics = self._quality_metrics(text, title=title, snippet=snippet, reason=reason)
+        length_score = min(clean_chars / 1200.0, 1.0)
+        if clean_chars > 12000 and metrics["noise_penalty"] > 0.25:
+            length_score *= 0.75
+        final_score = (
+            quality_score * 0.72
+            + metrics["purity"] * 0.08
+            + length_score * 0.10
+            + metrics["context"] * 0.06
+            + metrics["technical"] * 0.04
+            - metrics["noise_penalty"] * 0.16
+        )
+        if metrics["forum_aggregation"] >= 0.50 and metrics["context"] < 0.40:
+            final_score *= 0.35
+        elif metrics["forum_aggregation"] >= 0.20 and metrics["context"] < 0.40:
+            final_score -= 0.25
+        if clean_chars < self.web_read_min_clean_chars:
+            final_score -= 0.12
+        candidate.final_score = max(0.0, min(1.0, final_score))
+        candidate.selection_reason = (
+            f"base={quality_score:.4f};purity={metrics['purity']:.2f};"
+            f"context={metrics['context']:.2f};tech={metrics['technical']:.2f};"
+            f"length={clean_chars};noise={metrics['noise_penalty']:.2f};"
+            f"forum_agg={metrics['forum_aggregation']:.2f}"
+        )
+        metadata["competitive_final_score"] = candidate.final_score
+        metadata["competitive_selection_reason"] = candidate.selection_reason
+
+    def _quality_metrics(self, text: str, *, title: str, snippet: str, reason: str) -> dict[str, float]:
+        lowered = text.lower()
+        tokens = re.findall(r"[a-zA-Z0-9_.+-]+|[\u4e00-\u9fff]{2,}", lowered)
+        token_count = max(len(tokens), 1)
+        link_density = (lowered.count("](") + lowered.count("http://") + lowered.count("https://")) / token_count
+        nav_hits = sum(1 for token in tokens if token in _WEB_READ_NAV_WORDS)
+        forum_noise = self._reason_float(reason, "forum_noise")
+        mojibake = self._reason_float(reason, "mojibake")
+        repeat = self._reason_float(reason, "repeat")
+        forum_aggregation = self._forum_aggregation_noise(text)
+        noise_penalty = min(
+            link_density * 2.5
+            + (nav_hits / token_count * 2.0)
+            + mojibake
+            + repeat * 0.5
+            + forum_noise * 0.025
+            + forum_aggregation,
+            1.0,
+        )
+        context = self._token_overlap(text, f"{title} {snippet}")
+        technical = min(self._technical_hits(tokens) / 8.0, 1.0)
+        purity = max(0.0, 1.0 - noise_penalty)
+        return {"purity": purity, "context": context, "technical": technical, "noise_penalty": noise_penalty, "forum_aggregation": forum_aggregation}
+
+    def _candidate_score_records(self, candidates: list[WebReadCandidate]) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for candidate in candidates:
+            evidence = candidate.evidence
+            records.append(
+                {
+                    "backend": candidate.backend,
+                    "final_score": round(candidate.final_score, 4),
+                    "quality_score": round(float(evidence.metadata.get("quality_score") or 0.0), 4) if evidence else 0.0,
+                    "chars": len(evidence.content or "") if evidence else 0,
+                    "clean_chars": int(evidence.metadata.get("clean_chars") or len(evidence.content or "")) if evidence else 0,
+                    "elapsed_seconds": round(candidate.elapsed_seconds, 3),
+                    "reason": candidate.selection_reason,
+                    "error": candidate.error,
+                }
+            )
+        return records
+
+    def _candidate_purity(self, candidate: WebReadCandidate) -> float:
+        if not candidate.evidence:
+            return 0.0
+        metrics = self._quality_metrics(
+            candidate.evidence.content or "",
+            title=candidate.evidence.title or "",
+            snippet="",
+            reason=str(candidate.evidence.metadata.get("quality_reason") or ""),
+        )
+        return metrics["purity"]
+
+    def _reason_float(self, reason: str, key: str) -> float:
+        match = re.search(rf"(?:^|;){re.escape(key)}=([0-9.]+)", reason or "")
+        if not match:
+            return 0.0
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return 0.0
+
+    def _token_overlap(self, content: str, context: str) -> float:
+        context_tokens = {token for token in re.findall(r"[a-zA-Z0-9_.+-]+|[\u4e00-\u9fff]{2,}", (context or "").lower()) if len(token) >= 4}
+        if not context_tokens:
+            return 0.0
+        content_tokens = set(re.findall(r"[a-zA-Z0-9_.+-]+|[\u4e00-\u9fff]{2,}", (content or "").lower()))
+        return len(context_tokens & content_tokens) / max(len(context_tokens), 1)
+
+    def _technical_hits(self, tokens: list[str]) -> int:
+        text = " ".join(tokens)
+        model_hits = len(re.findall(r"\b[a-z]{1,8}\d{2,6}[a-z0-9_.+-]*\b|\b\d+(?:\.\d+)?\s?(?:v|a|ma|uf|nf|pf|ohm|khz|mhz|w)\b", text, re.I))
+        term_hits = sum(
+            1
+            for term in ("voltage", "current", "resistor", "capacitor", "mosfet", "stm32", "emc", "i2c", "lcd", "relay", "feedback", "filter", "电压", "电流", "电阻", "电容", "电源", "电路")
+            if term.lower() in text
+        )
+        return model_hits + term_hits
+
+    def _forum_aggregation_noise(self, text: str) -> float:
+        if not text:
+            return 0.0
+        window = text[:2500]
+        markers = (
+            "个人签名",
+            "默认摸鱼",
+            "ta的资源",
+            "最新帖子",
+            "最新回复",
+            "技术支持",
+            "本帖最后由",
+            "官方资源",
+            "欢迎大家推荐资源",
+            "返回列表",
+            "我要发帖",
+            "切换旧版",
+        )
+        hits = sum(window.count(marker) for marker in markers)
+        if hits <= 1:
+            return 0.0
+        return min(hits * 0.08, 0.7)
+
+    def _run_crawl4ai_candidate(self, url: str, title: str, snippet: str) -> tuple[ToolRun | None, str | None]:
+        if not self.enable_crawl4ai:
+            return None, None
+        crawl4ai_result = self.crawl4ai_fetcher.fetch(
+            url,
+            max_chars=self.crawl4ai_max_chars,
+            title=title,
+            snippet=snippet,
+        )
+        if not crawl4ai_result.evidence:
+            return None, crawl4ai_result.error
+
+        crawl4ai_result.evidence.title = title or crawl4ai_result.evidence.title or url
+        crawl4ai_result.evidence = self._clean_evidence(
+            crawl4ai_result.evidence,
+            title=crawl4ai_result.evidence.title,
+            snippet=snippet,
+            max_chars=self.crawl4ai_max_chars,
+            source_format="text",
+        )
+        final_score = float(crawl4ai_result.evidence.metadata.get("quality_score") or 0.0)
+        final_reason = str(crawl4ai_result.evidence.metadata.get("quality_reason") or "")
+        crawl4ai_result.evidence.metadata["read_backend"] = "crawl4ai"
+        crawl4ai_result.evidence.metadata["crawl4ai_quality_score"] = final_score
+        crawl4ai_result.evidence.metadata["crawl4ai_quality_reason"] = final_reason
+        if self._evidence_has_content(crawl4ai_result.evidence):
+            return (
+                ToolRun(
+                    [crawl4ai_result.evidence],
+                    summary=f"read page with crawl4ai {url}",
+                    metadata={"read_backend": "crawl4ai"},
+                ),
+                None,
+            )
+        return None, self._low_quality_evidence_error("crawl4ai", crawl4ai_result.evidence)
+
+    def _run_scrapling_candidate(self, url: str, title: str, snippet: str) -> tuple[ToolRun | None, str | None]:
+        if not self.enable_scrapling:
+            return None, None
+        scrapling_result = self.scrapling_fetcher.fetch(
+            url,
+            max_chars=self.scrapling_max_chars,
+            title=title,
+            snippet=snippet,
+        )
+        if not scrapling_result.evidence:
+            return None, scrapling_result.error
+
+        scrapling_result.evidence.title = title or scrapling_result.evidence.title or url
+        scrapling_result.evidence = self._clean_evidence(
+            scrapling_result.evidence,
+            title=scrapling_result.evidence.title,
+            snippet=snippet,
+            max_chars=self.scrapling_max_chars,
+            source_format="text",
+        )
+        final_score = float(scrapling_result.evidence.metadata.get("quality_score") or 0.0)
+        final_reason = str(scrapling_result.evidence.metadata.get("quality_reason") or "")
+        scrapling_result.evidence.metadata["read_backend"] = "scrapling"
+        scrapling_result.evidence.metadata["scrapling_quality_score"] = final_score
+        scrapling_result.evidence.metadata["scrapling_quality_reason"] = final_reason
+        if self._evidence_has_content(scrapling_result.evidence):
+            return (
+                ToolRun(
+                    [scrapling_result.evidence],
+                    summary=f"read page with Scrapling {url}",
+                    metadata={"read_backend": "scrapling"},
+                ),
+                None,
+            )
+        return None, self._low_quality_evidence_error("scrapling", scrapling_result.evidence)
+
+    def _jina_evidence(self, url: str, title: str, jina_result: ExtractedContent) -> Evidence:
+        return Evidence(
+            source=url,
+            title=compact_text(title or url, 300),
+            content=jina_result.content,
+            metadata={
+                "kind": "web_page",
+                "read_backend": "jina_reader",
+                "extractor": jina_result.extractor,
+                "quality_score": jina_result.quality_score,
+                "quality_reason": jina_result.quality_reason,
+                "raw_chars": jina_result.raw_chars,
+                "clean_chars": jina_result.clean_chars,
+                "extractor_metadata": jina_result.metadata,
+            },
+        )
+
+    def _fetch_jina(self, url: str, title: str = "", snippet: str = "", max_chars: int = 8000) -> ExtractedContent | None:
+        candidates: list[ExtractedContent] = []
+        for strategy, headers, source_format in self._jina_request_strategies(include_readerlm=False):
+            result = self._request_jina(
+                url,
+                headers=headers,
+                title=title,
+                snippet=snippet,
+                max_chars=max_chars,
+                source_format=source_format,
+            )
+            if result:
+                result.extractor = f"jina_{strategy}+{result.extractor}"
+                candidates.append(result)
+
+        best = self._best_extraction(candidates)
+        if best and best.acceptable(self.jina_min_quality_score, self.jina_min_clean_chars):
+            return best
+
+        if self.jina_use_readerlm_fallback:
+            for strategy, headers, source_format in self._jina_request_strategies(include_readerlm=True):
+                result = self._request_jina(
+                    url,
+                    headers=headers,
+                    title=title,
+                    snippet=snippet,
+                    max_chars=max_chars,
+                    source_format=source_format,
+                )
+                if result:
+                    result.extractor = f"jina_{strategy}+{result.extractor}"
+                    candidates.append(result)
+            best = self._best_extraction(candidates)
+        return best
+
+    def _jina_request_strategies(self, include_readerlm: bool) -> list[tuple[str, dict[str, str], str]]:
+        remove_selector = (
+            "nav, header, footer, aside, script, style, noscript, form, iframe, "
+            ".sidebar, .menu, .breadcrumb, .cookie, .modal, .advertisement, .ads"
+        )
+        base_headers = {
+            "X-Return-Format": "markdown",
+            "X-Remove-Selector": remove_selector,
+        }
+        if include_readerlm:
+            readerlm_headers = dict(base_headers)
+            readerlm_headers["X-Respond-With"] = "readerlm-v2"
+            return [("readerlm_v2", readerlm_headers, "text")]
+        return [("markdown", base_headers, "text")]
+
+    def _request_jina(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str],
+        title: str,
+        snippet: str,
+        max_chars: int,
+        source_format: str,
+    ) -> ExtractedContent | None:
+        try:
+            response = requests.get(
+                f"https://r.jina.ai/{url}",
+                headers=headers,
+                timeout=self.reader.timeout,
+            )
+            if response.status_code == 200 and len(response.text) > 100:
+                return self._extract_text(
+                    response.text,
+                    title=title,
+                    snippet=snippet,
+                    max_chars=max_chars,
+                    source_format=source_format,
+                )
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    def _extract_text(
+        self,
+        text: str,
+        *,
+        title: str,
+        snippet: str,
+        max_chars: int,
+        source_format: str,
+    ) -> ExtractedContent:
+        if self.enable_content_extraction:
+            return extract_llm_markdown(
+                text,
+                title=title,
+                snippet=snippet,
+                max_chars=max_chars,
+                source_format=source_format,
+            )
+        return ExtractedContent(
+            content=compact_text(text, max_chars=max_chars),
+            quality_score=1.0 if text else 0.0,
+            quality_reason="content_extraction_disabled",
+            extractor="none",
+            raw_chars=len(text or ""),
+            clean_chars=len(text or ""),
+        )
+
+    def _clean_evidence(
+        self,
+        evidence: Evidence,
+        *,
+        title: str,
+        snippet: str,
+        max_chars: int,
+        source_format: str,
+    ) -> Evidence:
+        result = self._extract_text(
+            evidence.content,
+            title=title,
+            snippet=snippet,
+            max_chars=max_chars,
+            source_format=source_format,
+        )
+        evidence.content = result.content
+        evidence.metadata.update(
+            {
+                "extractor": result.extractor,
+                "quality_score": result.quality_score,
+                "quality_reason": result.quality_reason,
+                "raw_chars": result.raw_chars,
+                "clean_chars": result.clean_chars,
+                "extractor_metadata": result.metadata,
+            }
+        )
+        return evidence
+
+    def _evidence_has_content(self, evidence: Evidence) -> bool:
+        return bool((evidence.content or "").strip())
+
+    def _low_quality_evidence_error(self, backend: str, evidence: Evidence) -> str:
+        return (
+            f"{backend}: low quality "
+            f"score={float(evidence.metadata.get('quality_score') or 0.0):.2f} "
+            f"chars={int(evidence.metadata.get('clean_chars') or len(evidence.content or ''))} "
+            f"reason={evidence.metadata.get('quality_reason') or 'empty'}"
+        )
+
+    def _best_extraction(self, candidates: list[ExtractedContent]) -> ExtractedContent | None:
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: (item.quality_score, item.clean_chars))
+
+    def _run_compare(self, url: str, title: str, snippet: str) -> ToolRun:
+        import json as _json
+
+        crawl4ai_score, crawl4ai_chars, crawl4ai_error = 0.0, 0, ""
+        jina_score, jina_chars, jina_error = 0.0, 0, ""
+        scrapling_score, scrapling_chars, scrapling_error = 0.0, 0, ""
+
+        crawl4ai_result = None
+        if self.enable_crawl4ai:
+            c4a = self.crawl4ai_fetcher.fetch(
+                url,
+                max_chars=self.crawl4ai_max_chars,
+                title=title,
+                snippet=snippet,
+            )
+            if c4a.evidence:
+                c4a.evidence = self._clean_evidence(
+                    c4a.evidence, title=title or url, snippet=snippet,
+                    max_chars=self.crawl4ai_max_chars, source_format="text",
+                )
+                crawl4ai_score = float(c4a.evidence.metadata.get("quality_score") or c4a.quality_score or 0.0)
+                crawl4ai_chars = len(c4a.evidence.content or "")
+                crawl4ai_result = c4a
+            else:
+                crawl4ai_error = c4a.error or "crawl4ai: empty"
+
+        jina_extracted = None
+        if self.enable_jina_reader:
+            jina_extracted = self._fetch_jina(url, title=title, snippet=snippet, max_chars=self.jina_max_chars)
+            if jina_extracted:
+                jina_score = jina_extracted.quality_score
+                jina_chars = jina_extracted.clean_chars
+            else:
+                jina_error = "jina_reader: empty or failed"
+
+        scrapling_result = None
+        if self.enable_scrapling:
+            spl = self.scrapling_fetcher.fetch(
+                url,
+                max_chars=self.scrapling_max_chars,
+                title=title,
+                snippet=snippet,
+            )
+            if spl.evidence:
+                spl.evidence = self._clean_evidence(
+                    spl.evidence, title=title or url, snippet=snippet,
+                    max_chars=self.scrapling_max_chars, source_format="text",
+                )
+                scrapling_score = float(spl.evidence.metadata.get("quality_score") or spl.quality_score or 0.0)
+                scrapling_chars = len(spl.evidence.content or "")
+                scrapling_result = spl
+            else:
+                scrapling_error = spl.error or "scrapling: empty"
+
+        scores = {"crawl4ai": crawl4ai_score, "jina": jina_score, "scrapling": scrapling_score}
+        if all(score <= 0.0 for score in scores.values()):
+            winner = "tie_failed"
+        else:
+            winner = max(scores.items(), key=lambda item: item[1])[0]
+        comparison = {
+            "url": url,
+            "crawl4ai_score": round(crawl4ai_score, 4),
+            "crawl4ai_chars": crawl4ai_chars,
+            "crawl4ai_error": crawl4ai_error,
+            "jina_score": round(jina_score, 4),
+            "jina_chars": jina_chars,
+            "jina_error": jina_error,
+            "scrapling_score": round(scrapling_score, 4),
+            "scrapling_chars": scrapling_chars,
+            "scrapling_error": scrapling_error,
+            "winner": winner,
+        }
+        self._log_comparison(comparison)
+
+        if winner == "crawl4ai" and crawl4ai_result and crawl4ai_result.evidence:
+            crawl4ai_result.evidence.title = title or crawl4ai_result.evidence.title or url
+            crawl4ai_result.evidence.metadata["read_backend"] = "crawl4ai"
+            crawl4ai_result.evidence.metadata["compare_mode"] = True
+            crawl4ai_result.evidence.metadata["compare_winner"] = "crawl4ai"
+            crawl4ai_result.evidence.metadata["jina_score"] = jina_score
+            return ToolRun(
+                [crawl4ai_result.evidence],
+                summary=f"compare mode: crawl4ai won for {url}",
+                metadata={"read_backend": "crawl4ai", "compare_mode": True, "comparison": comparison},
+            )
+
+        if winner == "scrapling" and scrapling_result and scrapling_result.evidence:
+            scrapling_result.evidence.title = title or scrapling_result.evidence.title or url
+            scrapling_result.evidence.metadata["read_backend"] = "scrapling"
+            scrapling_result.evidence.metadata["compare_mode"] = True
+            scrapling_result.evidence.metadata["compare_winner"] = "scrapling"
+            scrapling_result.evidence.metadata["crawl4ai_score"] = crawl4ai_score
+            scrapling_result.evidence.metadata["jina_score"] = jina_score
+            return ToolRun(
+                [scrapling_result.evidence],
+                summary=f"compare mode: Scrapling won for {url}",
+                metadata={"read_backend": "scrapling", "compare_mode": True, "comparison": comparison},
+            )
+
+        if jina_extracted and jina_extracted.acceptable(self.jina_min_quality_score, self.jina_min_clean_chars):
+            evidence = self._jina_evidence(url, title, jina_extracted)
+            evidence.metadata.update(
+                {
+                    "compare_mode": True,
+                    "compare_winner": "jina",
+                    "crawl4ai_score": crawl4ai_score,
+                    "scrapling_score": scrapling_score,
+                }
+            )
+            return ToolRun(
+                [evidence],
+                summary=f"compare mode: jina won for {url}",
+                metadata={"read_backend": "jina_reader", "compare_mode": True, "comparison": comparison},
+            )
+
+        return ToolRun(
+            [],
+            summary=f"compare mode: both backends failed for {url}",
+            success=False,
+            errors=[e for e in [crawl4ai_error, jina_error, scrapling_error] if e],
+            metadata={"read_backend": "compare_failed", "compare_mode": True, "comparison": comparison},
+        )
+
+    def _log_comparison(self, comparison: dict) -> None:
+        if not self.backend_comparison_path:
+            return
+        try:
+            import json as _json
+            path = Path(self.backend_comparison_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(_json.dumps(comparison, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
     def close(self) -> None:
         if hasattr(self.openhands_browser, "close"):
             self.openhands_browser.close()
+        if hasattr(self, "crawl4ai_fetcher") and hasattr(self.crawl4ai_fetcher, "close"):
+            self.crawl4ai_fetcher.close()
+        if hasattr(self, "scrapling_fetcher") and hasattr(self.scrapling_fetcher, "close"):
+            self.scrapling_fetcher.close()
 
 
 class DomainSkillExecutor(BaseEvidenceExecutor):
@@ -1216,6 +2324,92 @@ def _optimized_image_bytes(path: Path, max_side: int = 1600, quality: int = 80) 
             return output.getvalue()
     except Exception:
         return None
+
+
+def _normalize_search_url(url: str) -> str:
+    parsed = urlparse(url or "")
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    path = parsed.path.rstrip("/")
+    return f"{parsed.scheme}://{parsed.netloc.lower()}{path}"
+
+
+def _low_value_search_reason(item: Evidence) -> str:
+    parsed = urlparse(item.source or "")
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").lower()
+    title = (item.title or "").lower()
+    content = (item.content or "").lower()
+    if _host_matches(host, _LOW_VALUE_SEARCH_HOSTS):
+        return f"low_value_host:{host}"
+    if any(marker in path for marker in _LOW_VALUE_SEARCH_PATH_MARKERS):
+        return "low_value_path"
+    if any(marker in title for marker in _LOW_VALUE_SEARCH_TITLE_MARKERS):
+        if not _has_strong_model_signal(f"{title} {content}"):
+            return "low_value_title"
+        if any(marker in title for marker in ("淘宝", "天猫", "店铺", "好货")):
+            return "ecommerce_page"
+    if "最新作品发布时间" in item.content or "综合视频" in item.content:
+        return "short_video_search_page"
+    if "欢迎来到淘宝网" in item.content or "登录查看更多优惠" in item.content:
+        return "ecommerce_page"
+    return ""
+
+
+def _search_relevance_score(query: str, item: Evidence) -> tuple[float, str]:
+    text = f"{item.title} {item.content} {item.source}"
+    lowered = text.lower()
+    terms = _search_terms(query)
+    if not terms:
+        return max(float(item.score or 0.0), 0.1), "no_terms"
+    exact_hits = [term for term in terms if _term_present(term, lowered)]
+    model_terms = [term for term in terms if _is_model_like(term)]
+    model_hits = [term for term in model_terms if _term_present(term, lowered)]
+    coverage = len(exact_hits) / max(len(terms), 1)
+    base_score = float(item.score or 0.0)
+    score = base_score + (coverage * 3.0) + (len(model_hits) * 2.0)
+    if _trusted_source(item.source):
+        score += 1.0
+    if model_terms and not model_hits:
+        score -= 1.5
+        if coverage < 0.35 and not _trusted_source(item.source):
+            return 0.0, f"missing_model_terms:{coverage:.2f}"
+    if coverage < 0.12 and not model_hits and not _trusted_source(item.source):
+        return 0.0, f"low_query_overlap:{coverage:.2f}"
+    if base_score <= 0 and coverage < 0.2 and not model_hits and not _trusted_source(item.source):
+        return 0.0, f"zero_provider_score_low_overlap:{coverage:.2f}"
+    return max(score, 0.01), f"coverage={coverage:.2f};models={len(model_hits)}/{len(model_terms)}"
+
+
+def _host_matches(host: str, blocked_hosts: set[str]) -> bool:
+    return any(host == blocked or host.endswith(f".{blocked}") for blocked in blocked_hosts)
+
+
+def _search_terms(text: str) -> list[str]:
+    raw_terms = re.findall(r"[A-Za-z]{1,8}\d{0,6}[A-Za-z0-9_.+-]*|[A-Za-z]{3,}|[\u4e00-\u9fff]{2,}|\d+(?:\.\d+)?[A-Za-z%]*", text or "")
+    terms: list[str] = []
+    for term in raw_terms:
+        cleaned = term.strip().lower()
+        if not cleaned or cleaned in _SEARCH_STOP_TERMS:
+            continue
+        if len(cleaned) < 2:
+            continue
+        terms.append(cleaned)
+    return list(dict.fromkeys(terms))
+
+
+def _is_model_like(term: str) -> bool:
+    return bool(re.search(r"[a-z]{1,8}\d{2,6}|\d{2,6}[a-z]{1,8}", term, re.I))
+
+
+def _has_strong_model_signal(text: str) -> bool:
+    return bool(re.search(r"\b(?:tl431|lm358|uc384\d|rk3399|at32f\d+|esp32|mr\d+|irf\d+)\b", text, re.I))
+
+
+def _term_present(term: str, lowered_text: str) -> bool:
+    if re.fullmatch(r"[a-z0-9_.+-]+", term):
+        return re.search(r"(?<![a-z0-9_.+-])" + re.escape(term) + r"(?![a-z0-9_.+-])", lowered_text) is not None
+    return term in lowered_text
 
 
 def _search_evidence(query: str, provider: str, title: str, url: str, content: str, score: float) -> Evidence:

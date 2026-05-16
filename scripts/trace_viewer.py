@@ -36,11 +36,24 @@ class TraceRequest(BaseModel):
 
 @app.post("/api/traces")
 def list_traces(req: DirRequest):
-    trace_dir = Path(req.path).expanduser().resolve()
-    if not trace_dir.is_dir():
-        raise HTTPException(400, f"directory not found: {trace_dir}")
+    p = Path(req.path).expanduser().resolve()
+    if p.is_file() and p.suffix == ".json":
+        # Single trace file: wrap into a one-item list
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            trace = {
+                "sample_id": data.get("sample_id", p.stem),
+                "steps": len(data.get("steps", [])),
+                "elapsed": data.get("elapsed_seconds", 0),
+                "errors": len(data.get("errors", [])),
+            }
+            return {"dir": str(p.parent), "count": 1, "traces": [trace]}
+        except Exception as e:
+            raise HTTPException(400, f"failed to read trace file: {e}")
+    if not p.is_dir():
+        raise HTTPException(400, f"directory not found: {p}")
     traces = []
-    for f in sorted(trace_dir.glob("*.trace.json")):
+    for f in sorted(p.glob("*.trace.json")):
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
             traces.append({
@@ -51,7 +64,7 @@ def list_traces(req: DirRequest):
             })
         except Exception:
             pass
-    return {"dir": str(trace_dir), "count": len(traces), "traces": traces}
+    return {"dir": str(p), "count": len(traces), "traces": traces}
 
 
 @app.post("/api/trace")
@@ -302,7 +315,7 @@ a { color: var(--accent); text-decoration: none; }
     Agent Trace Viewer
   </div>
   <div class="dir-input-wrap">
-    <input class="dir-input" id="dirInput" type="text" placeholder="输入轨迹目录路径，如 outputs/qwen_search_demo/traces" value="">
+    <input class="dir-input" id="dirInput" type="text" placeholder="输入目录或 .trace.json 文件路径" value="">
     <button class="btn btn-primary" id="loadBtn" onclick="loadDir()">加载</button>
   </div>
   <div class="loading" id="loading"><div class="spinner"></div>加载中...</div>

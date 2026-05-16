@@ -38,7 +38,8 @@ class WebReader:
             content_type = response.headers.get("content-type", "")
             if "text/html" not in content_type and "text/plain" not in content_type and content_type:
                 return WebReadResult(evidence=None, error=f"unsupported content-type: {content_type}")
-            soup = BeautifulSoup(response.text, "html.parser")
+            text = self._response_text(response)
+            soup = BeautifulSoup(text, "html.parser")
             for tag in soup(["script", "style", "noscript", "nav", "footer", "header"]):
                 tag.decompose()
             title = soup.title.get_text(" ", strip=True) if soup.title else response.url
@@ -62,3 +63,11 @@ class WebReader:
         host = parsed.hostname or ""
         blocked = ("localhost", "127.", "10.", "192.168.", "172.16.", "0.0.0.0")
         return not any(host.startswith(prefix) for prefix in blocked)
+
+    def _response_text(self, response: requests.Response) -> str:
+        encoding = response.encoding or ""
+        if not encoding or encoding.lower() in {"iso-8859-1", "ascii"}:
+            apparent = response.apparent_encoding
+            if apparent:
+                response.encoding = apparent
+        return response.text

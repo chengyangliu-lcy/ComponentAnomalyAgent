@@ -22,6 +22,10 @@ dependencies = [
     "torchaudio==2.11.0",
     "fastapi>=0.136.1",
     "uvicorn>=0.44.0",
+    "trafilatura>=1.12.0",
+    "readability-lxml>=0.8.1",
+    "crawl4ai>=0.6.0",
+    "scrapling>=0.2.99",
 ]
 
 [tool.uv]

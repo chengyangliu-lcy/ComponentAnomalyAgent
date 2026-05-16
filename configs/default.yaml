@@ -42,6 +42,78 @@ agent:
   openhands_browser_timeout_seconds: 15
   openhands_browser_max_chars: 6000
   openhands_browser_require_installed: true
+  enable_jina_reader: true
+  jina_max_chars: 8000
+  jina_use_readerlm_fallback: true
+  jina_min_quality_score: 0.55
+  jina_min_clean_chars: 500
+  enable_crawl4ai: true
+  crawl4ai_timeout_seconds: 15
+  crawl4ai_max_chars: 8000
+  crawl4ai_word_count_threshold: 10
+  crawl4ai_use_content_filter: true
+  crawl4ai_content_filter_type: bm25     # "pruning" or "bm25"; bm25 uses title/snippet context
+  crawl4ai_primary: false                # false = Jina first, crawl4ai as enhanced fallback
+  crawl4ai_markdown_mode: best           # "best", "fit", or "raw"
+  crawl4ai_content_source: markdown      # "best", "markdown", or "cleaned_html"
+  crawl4ai_enable_stealth: true
+  crawl4ai_scan_full_page: true
+  crawl4ai_delay_before_return_html: 0.5
+  crawl4ai_css_selector: ""              # optional hard restriction, e.g. "article"
+  crawl4ai_target_elements: []           # optional focused selectors; keep empty for generic extraction
+  crawl4ai_excluded_tags:
+    - nav
+    - footer
+    - header
+    - aside
+    - script
+    - style
+    - noscript
+    - form
+  crawl4ai_excluded_selector: >-
+    header, footer, nav, aside, form,
+    .sidebar, .side-bar, .rightbar, .right-bar, .leftbar, .left-bar,
+    .recommend, .recommended, .related, .related-posts, .hot, .rank, .ranking,
+    .advertisement, .advertisements, .ads, .ad, .banner, .cookie, .modal,
+    .comment, .comments, .reply, .share, .social, .breadcrumb, .pagination,
+    .toolbar, .copyright, .download, .login, .register
+  enable_scrapling: true                # third web fetch backend for competitive read
+  scrapling_timeout_seconds: 25
+  scrapling_max_chars: 8000
+  scrapling_mode: dynamic               # "fetcher", "dynamic", or "stealthy"
+  scrapling_content_source: html        # "html" or "text"
+  scrapling_auto_match: true            # use Scrapling adaptive selector matching
+  scrapling_network_idle: true          # dynamic/stealthy wait strategy
+  scrapling_wait_ms: 0
+  scrapling_wait_selector: ""
+  scrapling_disable_resources: false
+  scrapling_block_images: true
+  scrapling_google_search: true         # Scrapling fetchers can mimic Google referral
+  scrapling_real_chrome: false          # dynamic mode only; requires local Chrome
+  scrapling_css_selector: ""            # optional hard restriction, e.g. "article"
+  scrapling_target_elements: []         # optional focused selectors; empty = generic candidates
+  scrapling_excluded_tags:
+    - nav
+    - footer
+    - header
+    - aside
+    - script
+    - style
+    - noscript
+    - form
+  scrapling_excluded_selector: >-
+    header, footer, nav, aside, form,
+    .sidebar, .side-bar, .rightbar, .right-bar, .leftbar, .left-bar,
+    .recommend, .recommended, .related, .related-posts, .hot, .rank, .ranking,
+    .advertisement, .advertisements, .ads, .ad, .banner, .cookie, .modal,
+    .comment, .comments, .reply, .share, .social, .breadcrumb, .pagination,
+    .toolbar, .copyright, .download, .login, .register
+  web_read_competitive_mode: true        # true = run Jina+crawl4ai+Scrapling dynamic in parallel and select best
+  web_read_competitive_timeout_seconds: 35
+  web_read_min_quality_score: 0.30
+  web_read_min_clean_chars: 300
+  web_read_compare_mode: false           # true = legacy compare logging mode
+  enable_trafilatura_extraction: true
   max_consecutive_tool_errors: 3
   max_planner_failures: 2
   tool_concurrency_limit: 4
@@ -64,7 +136,8 @@ agent:
   web_search_mode: auto
   enable_llm_web_decision: false
   min_evidence_before_search: 2
-  enable_browser_fallback: false
+  enable_browser_fallback: true
+  browser_fallback_wait_ms: 2500
   use_images: true
   send_images_to_llm: true
   enable_image_inspection_llm: true
@@ -77,11 +150,13 @@ agent:
 
 web:
   provider_order:
+    - searxng
     - html
     - tavily
     - brave
     - bing
     - serpapi
+  searxng_url: "http://127.0.0.1:9980"
   max_results_per_query: 6
   max_pages_to_read: 3
   api_key_envs:
